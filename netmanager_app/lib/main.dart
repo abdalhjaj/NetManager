@@ -1,3 +1,5 @@
+import 'package:flutter/services.dart';
+
 import 'app_update_service.dart';
 import 'app_update_dialog.dart';
 
@@ -24,6 +26,79 @@ AppUser? currentUser;
 
 const _savedUserIdKey = 'qasr_alhajjaj_saved_user_id';
 
+String? accountAccessError(AppUser user) {
+  if (!user.active || user.accountStatus == 'suspended') {
+    return 'هذا الحساب موقوف. يرجى التواصل مع الإدارة.';
+  }
+
+  if (user.accountStatus == 'trial') {
+    final expiresAt = user.trialExpiresAt;
+
+    if (expiresAt == null || !expiresAt.isAfter(DateTime.now())) {
+      return 'انتهت الفترة التجريبية. يرجى تفعيل الاشتراك.';
+    }
+  }
+
+  return null;
+}
+
+Future<AppUser> signInNewAccount({
+  required String email,
+  required String password,
+}) async {
+  final supabase = Supabase.instance.client;
+
+  final response = await supabase.auth.signInWithPassword(
+    email: email.trim().toLowerCase(),
+    password: password,
+  );
+
+  final authUser = response.user;
+
+  if (authUser == null) {
+    throw Exception('تعذر تسجيل الدخول. تحقق من بيانات الحساب.');
+  }
+
+  try {
+    final data = await supabase
+        .from('app_users')
+        .select()
+        .eq('auth_user_id', authUser.id)
+        .single();
+
+    final user = AppUser.fromJson(Map<String, dynamic>.from(data));
+
+    final error = accountAccessError(user);
+
+    if (error != null) {
+      throw Exception(error);
+    }
+
+    return user;
+  } catch (_) {
+    await supabase.auth.signOut();
+    rethrow;
+  }
+}
+
+// التحقق من حاجة الحساب الجديد إلى إعداد الشبكة لأول مرة.
+Future<bool> needsInitialNetworkSetup(AppUser user) async {
+  // المدير والحسابات القديمة لا تحتاج إلى الإعداد الأولي.
+  if (user.authUserId == null || user.role == 'مدير') {
+    return false;
+  }
+
+  // يكفي وجود شبكة واحدة مكتملة الإعداد.
+  final data = await Supabase.instance.client
+      .from('network_connections')
+      .select('id')
+      .eq('user_id', user.id)
+      .eq('setup_completed', true)
+      .limit(1);
+
+  return data.isEmpty;
+}
+
 Future<void> saveLoggedInUser(String userId) async {
   final prefs = await SharedPreferences.getInstance();
   await prefs.setString(_savedUserIdKey, userId);
@@ -35,6 +110,34 @@ Future<void> clearLoggedInUser() async {
 }
 
 Future<AppUser?> restoreLoggedInUser() async {
+  final supabase = Supabase.instance.client;
+  final authUser = supabase.auth.currentUser;
+
+  // الحسابات الجديدة: الاعتماد على جلسة Supabase Auth.
+  if (authUser != null) {
+    try {
+      final data = await supabase
+          .from('app_users')
+          .select()
+          .eq('auth_user_id', authUser.id)
+          .single();
+
+      final user = AppUser.fromJson(Map<String, dynamic>.from(data));
+
+      if (accountAccessError(user) != null) {
+        await supabase.auth.signOut();
+        await clearLoggedInUser();
+        return null;
+      }
+
+      return user;
+    } catch (e) {
+      debugPrint('AUTH RESTORE ERROR: $e');
+      return null;
+    }
+  }
+
+  // الحسابات القديمة: دعم مؤقت إلى حين نقلها إلى Auth.
   final prefs = await SharedPreferences.getInstance();
   final savedId = prefs.getString(_savedUserIdKey);
 
@@ -44,14 +147,16 @@ Future<AppUser?> restoreLoggedInUser() async {
     await loadUsers();
 
     for (final user in users) {
-      if (user.id == savedId && user.active) {
+      if (user.id == savedId &&
+          user.authUserId == null &&
+          accountAccessError(user) == null) {
         return user;
       }
     }
 
     await clearLoggedInUser();
   } catch (e) {
-    debugPrint('RESTORE LOGIN ERROR: $e');
+    debugPrint('LEGACY RESTORE ERROR: $e');
   }
 
   return null;
@@ -84,6 +189,9 @@ Future<void> main() async {
 
 class AppUser {
   String id;
+  String? authUserId;
+  String accountStatus;
+  DateTime? trialExpiresAt;
   String username;
   String password;
   String name;
@@ -123,6 +231,9 @@ class AppUser {
 
   AppUser({
     this.id = '',
+    this.authUserId,
+    this.accountStatus = 'active',
+    this.trialExpiresAt,
     required this.username,
     required this.password,
     required this.name,
@@ -143,6 +254,9 @@ class AppUser {
 
   Map<String, dynamic> toJson() {
     return {
+      'auth_user_id': authUserId,
+      'account_status': accountStatus,
+      'trial_expires_at': trialExpiresAt?.toUtc().toIso8601String(),
       'username': username,
       'password': password,
       'name': name,
@@ -165,6 +279,11 @@ class AppUser {
   factory AppUser.fromJson(Map<String, dynamic> json) {
     return AppUser(
       id: json['id']?.toString() ?? '',
+      authUserId: json['auth_user_id']?.toString(),
+      accountStatus: json['account_status']?.toString() ?? 'active',
+      trialExpiresAt: DateTime.tryParse(
+        json['trial_expires_at']?.toString() ?? '',
+      ),
       username: json['username'] ?? '',
       password: json['password'] ?? '',
       name: json['name'] ?? '',
@@ -565,6 +684,425 @@ class _NetManagerAppState extends State<NetManagerApp> {
   }
 }
 
+// ============================================================
+// NetManager - Introduction / Onboarding
+// ============================================================
+class NetManagerOnboardingPage extends StatefulWidget {
+  const NetManagerOnboardingPage({super.key});
+
+  @override
+  State<NetManagerOnboardingPage> createState() =>
+      _NetManagerOnboardingPageState();
+}
+
+class _NetManagerOnboardingPageState extends State<NetManagerOnboardingPage> {
+  final PageController _controller = PageController();
+  int _page = 0;
+  bool _saving = false;
+
+  final List<Map<String, dynamic>> _pages = const [
+    {
+      'title': 'إدارة شبكتك بسهولة',
+      'description':
+          'تابع المشتركين والأجهزة والاشتراكات من مكان واحد، '
+          'ونظّم أعمال شبكتك بطريقة سهلة واحترافية.',
+      'icon': Icons.router_outlined,
+      'color': Color(0xFF414394),
+    },
+    {
+      'title': 'محاسبة متكاملة',
+      'description':
+          'أدر الفواتير والمبيعات والمشتريات والمخزون، '
+          'وتابع الديون وسندات القبض والصرف والتقارير المالية.',
+      'icon': Icons.account_balance_wallet_outlined,
+      'color': Color(0xFF00897B),
+    },
+    {
+      'title': 'تحكم كامل بشبكتك',
+      'description':
+          'نظّم حسابات Broadband وHotspot، '
+          'واضبط بيانات الاتصال بأجهزة MikroTik '
+          'لتكون شبكتك تحت إدارتك.',
+      'icon': Icons.hub_outlined,
+      'color': Color(0xFF1976D2),
+    },
+  ];
+
+  @override
+  void dispose() {
+    _controller.dispose();
+    super.dispose();
+  }
+
+  Future<void> _finish() async {
+    if (_saving) return;
+
+    setState(() => _saving = true);
+
+    try {
+      final prefs = await SharedPreferences.getInstance();
+      await prefs.setBool('netmanager_onboarding_completed', true);
+
+      if (!mounted) return;
+
+      Navigator.pushReplacement(
+        context,
+        MaterialPageRoute(builder: (_) => const LoginPage()),
+      );
+    } catch (e) {
+      if (!mounted) return;
+
+      setState(() => _saving = false);
+
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(content: Text('تعذر حفظ حالة صفحات التعريف: $e')),
+      );
+    }
+  }
+
+  void _next() {
+    if (_page == _pages.length - 1) {
+      _finish();
+    } else {
+      _controller.nextPage(
+        duration: const Duration(milliseconds: 350),
+        curve: Curves.easeInOut,
+      );
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final theme = Theme.of(context);
+    final color = _pages[_page]['color'] as Color;
+
+    return Scaffold(
+      body: SafeArea(
+        child: Padding(
+          padding: const EdgeInsets.symmetric(horizontal: 24, vertical: 20),
+          child: Column(
+            children: [
+              Row(
+                mainAxisAlignment: MainAxisAlignment.spaceBetween,
+                children: [
+                  const Text(
+                    'NetManager',
+                    style: TextStyle(fontSize: 23, fontWeight: FontWeight.bold),
+                  ),
+                  TextButton(
+                    onPressed: _saving ? null : _finish,
+                    child: const Text('تخطي'),
+                  ),
+                ],
+              ),
+              Expanded(
+                child: PageView.builder(
+                  controller: _controller,
+                  itemCount: _pages.length,
+                  onPageChanged: (index) {
+                    setState(() => _page = index);
+                  },
+                  itemBuilder: (context, index) {
+                    final page = _pages[index];
+                    final pageColor = page['color'] as Color;
+
+                    return Column(
+                      mainAxisAlignment: MainAxisAlignment.center,
+                      children: [
+                        Container(
+                          width: 190,
+                          height: 190,
+                          decoration: BoxDecoration(
+                            color: pageColor.withValues(alpha: 0.10),
+                            shape: BoxShape.circle,
+                          ),
+                          child: Icon(
+                            page['icon'] as IconData,
+                            size: 100,
+                            color: pageColor,
+                          ),
+                        ),
+                        const SizedBox(height: 45),
+                        Text(
+                          page['title'] as String,
+                          textAlign: TextAlign.center,
+                          style: theme.textTheme.headlineSmall?.copyWith(
+                            fontWeight: FontWeight.bold,
+                          ),
+                        ),
+                        const SizedBox(height: 18),
+                        Text(
+                          page['description'] as String,
+                          textAlign: TextAlign.center,
+                          style: theme.textTheme.bodyLarge?.copyWith(
+                            height: 1.8,
+                            color: theme.colorScheme.onSurfaceVariant,
+                          ),
+                        ),
+                      ],
+                    );
+                  },
+                ),
+              ),
+              Row(
+                mainAxisAlignment: MainAxisAlignment.center,
+                children: List.generate(
+                  _pages.length,
+                  (index) => AnimatedContainer(
+                    duration: const Duration(milliseconds: 250),
+                    width: index == _page ? 30 : 9,
+                    height: 9,
+                    margin: const EdgeInsets.symmetric(horizontal: 4),
+                    decoration: BoxDecoration(
+                      color: index == _page
+                          ? color
+                          : theme.colorScheme.outlineVariant,
+                      borderRadius: BorderRadius.circular(20),
+                    ),
+                  ),
+                ),
+              ),
+              const SizedBox(height: 28),
+              SizedBox(
+                width: double.infinity,
+                height: 54,
+                child: FilledButton(
+                  onPressed: _saving ? null : _next,
+                  style: FilledButton.styleFrom(
+                    backgroundColor: _page == _pages.length - 1
+                        ? const Color(0xFF2E7D32)
+                        : color,
+                  ),
+                  child: _saving
+                      ? const SizedBox(
+                          width: 22,
+                          height: 22,
+                          child: CircularProgressIndicator(
+                            color: Colors.white,
+                            strokeWidth: 2,
+                          ),
+                        )
+                      : Text(
+                          _page == _pages.length - 1 ? 'ابدأ الآن' : 'التالي',
+                          style: const TextStyle(
+                            fontSize: 17,
+                            fontWeight: FontWeight.bold,
+                          ),
+                        ),
+                ),
+              ),
+            ],
+          ),
+        ),
+      ),
+    );
+  }
+}
+
+class InitialNetworkSetupPage extends StatefulWidget {
+  final AppUser currentUser;
+
+  const InitialNetworkSetupPage({super.key, required this.currentUser});
+
+  @override
+  State<InitialNetworkSetupPage> createState() =>
+      _InitialNetworkSetupPageState();
+}
+
+class _InitialNetworkSetupPageState extends State<InitialNetworkSetupPage> {
+  final _formKey = GlobalKey<FormState>();
+
+  final networkNameController = TextEditingController();
+  final hostController = TextEditingController();
+  final usernameController = TextEditingController();
+  final passwordController = TextEditingController();
+  final portController = TextEditingController(text: '8728');
+
+  bool hidePassword = true;
+
+  @override
+  void dispose() {
+    networkNameController.dispose();
+    hostController.dispose();
+    usernameController.dispose();
+    passwordController.dispose();
+    portController.dispose();
+    super.dispose();
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return Scaffold(
+      appBar: AppBar(
+        title: const Text('إعداد الشبكة'),
+        automaticallyImplyLeading: false,
+        centerTitle: true,
+        actions: [
+          IconButton(
+            tooltip: 'تسجيل الخروج',
+            icon: const Icon(Icons.logout),
+            onPressed: () async {
+              await Supabase.instance.client.auth.signOut();
+              await clearLoggedInUser();
+              currentUser = null;
+
+              if (!mounted) return;
+
+              Navigator.pushAndRemoveUntil(
+                context,
+                MaterialPageRoute(builder: (_) => const LoginPage()),
+                (route) => false,
+              );
+            },
+          ),
+        ],
+      ),
+      body: Center(
+        child: ConstrainedBox(
+          constraints: const BoxConstraints(maxWidth: 560),
+          child: SingleChildScrollView(
+            padding: const EdgeInsets.all(20),
+            child: Card(
+              elevation: 3,
+              child: Padding(
+                padding: const EdgeInsets.all(24),
+                child: Form(
+                  key: _formKey,
+                  child: Column(
+                    crossAxisAlignment: CrossAxisAlignment.stretch,
+                    children: [
+                      const Icon(Icons.router, size: 64, color: Colors.blue),
+                      const SizedBox(height: 16),
+                      const Text(
+                        'مرحبًا بك في منصة قصر الحجاج',
+                        textAlign: TextAlign.center,
+                        style: TextStyle(
+                          fontSize: 22,
+                          fontWeight: FontWeight.bold,
+                        ),
+                      ),
+                      const SizedBox(height: 10),
+                      const Text(
+                        'أدخل بيانات شبكة MikroTik الخاصة بك '
+                        'لإكمال الإعداد الأولي.',
+                        textAlign: TextAlign.center,
+                      ),
+                      const SizedBox(height: 28),
+                      TextFormField(
+                        controller: networkNameController,
+                        decoration: const InputDecoration(
+                          labelText: 'اسم الشبكة',
+                          prefixIcon: Icon(Icons.wifi),
+                          border: OutlineInputBorder(),
+                        ),
+                        validator: (value) =>
+                            value == null || value.trim().isEmpty
+                            ? 'يرجى إدخال اسم الشبكة'
+                            : null,
+                      ),
+                      const SizedBox(height: 16),
+                      TextFormField(
+                        controller: hostController,
+                        decoration: const InputDecoration(
+                          labelText: 'عنوان MikroTik',
+                          hintText: '192.168.88.1 أو router.example.com',
+                          prefixIcon: Icon(Icons.language),
+                          border: OutlineInputBorder(),
+                        ),
+                        validator: (value) =>
+                            value == null || value.trim().isEmpty
+                            ? 'يرجى إدخال عنوان MikroTik'
+                            : null,
+                      ),
+                      const SizedBox(height: 16),
+                      TextFormField(
+                        controller: usernameController,
+                        decoration: const InputDecoration(
+                          labelText: 'اسم مستخدم MikroTik API',
+                          prefixIcon: Icon(Icons.person),
+                          border: OutlineInputBorder(),
+                        ),
+                        validator: (value) =>
+                            value == null || value.trim().isEmpty
+                            ? 'يرجى إدخال اسم المستخدم'
+                            : null,
+                      ),
+                      const SizedBox(height: 16),
+                      TextFormField(
+                        controller: passwordController,
+                        obscureText: hidePassword,
+                        decoration: InputDecoration(
+                          labelText: 'كلمة مرور MikroTik',
+                          prefixIcon: const Icon(Icons.lock),
+                          border: const OutlineInputBorder(),
+                          suffixIcon: IconButton(
+                            icon: Icon(
+                              hidePassword
+                                  ? Icons.visibility
+                                  : Icons.visibility_off,
+                            ),
+                            onPressed: () =>
+                                setState(() => hidePassword = !hidePassword),
+                          ),
+                        ),
+                        validator: (value) => value == null || value.isEmpty
+                            ? 'يرجى إدخال كلمة المرور'
+                            : null,
+                      ),
+                      const SizedBox(height: 16),
+                      TextFormField(
+                        controller: portController,
+                        keyboardType: TextInputType.number,
+                        decoration: const InputDecoration(
+                          labelText: 'منفذ API',
+                          prefixIcon: Icon(Icons.settings_ethernet),
+                          border: OutlineInputBorder(),
+                        ),
+                        validator: (value) {
+                          final port = int.tryParse(value?.trim() ?? '');
+                          if (port == null || port < 1 || port > 65535) {
+                            return 'أدخل منفذًا صحيحًا';
+                          }
+                          return null;
+                        },
+                      ),
+                      const SizedBox(height: 24),
+                      ElevatedButton.icon(
+                        onPressed: () {
+                          if (!_formKey.currentState!.validate()) return;
+
+                          ScaffoldMessenger.of(context).showSnackBar(
+                            const SnackBar(
+                              content: Text(
+                                'واجهة الإعداد جاهزة. '
+                                'سنفعّل اختبار الاتصال والحفظ الآمن '
+                                'في الخطوة التالية.',
+                              ),
+                            ),
+                          );
+                        },
+                        icon: const Icon(Icons.wifi_find),
+                        label: const Text('اختبار الاتصال وإكمال الإعداد'),
+                      ),
+                      const SizedBox(height: 12),
+                      const Text(
+                        'لن تُحفظ كلمة المرور قبل إعداد '
+                        'الاتصال الآمن بالخادم.',
+                        textAlign: TextAlign.center,
+                        style: TextStyle(fontSize: 12),
+                      ),
+                    ],
+                  ),
+                ),
+              ),
+            ),
+          ),
+        ),
+      ),
+    );
+  }
+}
+
 class AutoLoginGate extends StatefulWidget {
   const AutoLoginGate({super.key});
 
@@ -584,9 +1122,18 @@ class _AutoLoginGateState extends State<AutoLoginGate> {
     if (!mounted) return;
 
     if (user == null) {
+      final prefs = await SharedPreferences.getInstance();
+      if (!mounted) return;
+
+      final completed =
+          prefs.getBool('netmanager_onboarding_completed') ?? false;
+
       Navigator.pushReplacement(
         context,
-        MaterialPageRoute(builder: (_) => const LoginPage()),
+        MaterialPageRoute(
+          builder: (_) =>
+              completed ? const LoginPage() : const NetManagerOnboardingPage(),
+        ),
       );
       return;
     }
@@ -616,10 +1163,27 @@ class _AutoLoginGateState extends State<AutoLoginGate> {
 
     if (!mounted) return;
 
-    Navigator.pushReplacement(
-      context,
-      MaterialPageRoute(builder: (_) => DashboardPage(currentUser: user)),
-    );
+    try {
+      final needsSetup = await needsInitialNetworkSetup(user);
+      if (!mounted) return;
+
+      Navigator.pushReplacement(
+        context,
+        MaterialPageRoute(
+          builder: (_) => needsSetup
+              ? InitialNetworkSetupPage(currentUser: user)
+              : DashboardPage(currentUser: user),
+        ),
+      );
+    } catch (e) {
+      debugPrint('NETWORK SETUP CHECK ERROR: $e');
+      if (!mounted) return;
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(
+          content: Text('تعذر التحقق من إعداد الشبكة. حاول مجددًا.'),
+        ),
+      );
+    }
   }
 
   @override
@@ -677,17 +1241,22 @@ class _LoginPageState extends State<LoginPage> {
     }
 
     try {
-      // إعادة تحميل المستخدمين مباشرة من Supabase
-      await loadUsers();
-
       AppUser? user;
 
-      for (final item in users) {
-        if (item.username.trim() == username &&
-            item.password == password &&
-            item.active) {
-          user = item;
-          break;
+      if (username.contains('@')) {
+        user = await signInNewAccount(email: username, password: password);
+      } else {
+        // دعم الحسابات القديمة مؤقتًا.
+        await loadUsers();
+
+        for (final item in users) {
+          if (item.authUserId == null &&
+              item.username.trim() == username &&
+              item.password == password &&
+              accountAccessError(item) == null) {
+            user = item;
+            break;
+          }
         }
       }
 
@@ -772,9 +1341,16 @@ class _LoginPageState extends State<LoginPage> {
 
       if (!mounted) return;
 
+      final needsSetup = await needsInitialNetworkSetup(user);
+      if (!mounted) return;
+
       Navigator.pushReplacement(
         context,
-        MaterialPageRoute(builder: (_) => DashboardPage(currentUser: user!)),
+        MaterialPageRoute(
+          builder: (_) => needsSetup
+              ? InitialNetworkSetupPage(currentUser: user!)
+              : DashboardPage(currentUser: user!),
+        ),
       );
     } catch (e) {
       debugPrint('LOGIN ERROR: $e');
@@ -871,6 +1447,24 @@ class _LoginPageState extends State<LoginPage> {
                           label: const Text('تسجيل الدخول'),
                         ),
                       ),
+                      const SizedBox(height: 12),
+                      TextButton(
+                        onPressed: () {
+                          Navigator.push(
+                            context,
+                            MaterialPageRoute(
+                              builder: (_) => const NetManagerRegisterPage(),
+                            ),
+                          );
+                        },
+                        child: const Text(
+                          'ليس لديك حساب؟ أنشئ حسابك الآن',
+                          style: TextStyle(
+                            fontSize: 15,
+                            fontWeight: FontWeight.bold,
+                          ),
+                        ),
+                      ),
                       const SizedBox(height: 18),
                       Text(
                         appVersionText,
@@ -881,6 +1475,272 @@ class _LoginPageState extends State<LoginPage> {
                         ),
                       ),
                     ],
+                  ),
+                ),
+              ),
+            ),
+          ),
+        ),
+      ),
+    );
+  }
+}
+
+// ============================================================
+// NetManager - New Account Registration
+// ============================================================
+class NetManagerRegisterPage extends StatefulWidget {
+  const NetManagerRegisterPage({super.key});
+
+  @override
+  State<NetManagerRegisterPage> createState() => _NetManagerRegisterPageState();
+}
+
+class _NetManagerRegisterPageState extends State<NetManagerRegisterPage> {
+  final _formKey = GlobalKey<FormState>();
+
+  final fullNameController = TextEditingController();
+  final phoneController = TextEditingController();
+  final emailController = TextEditingController();
+  final passwordController = TextEditingController();
+  final confirmPasswordController = TextEditingController();
+
+  bool hidePassword = true;
+  bool hideConfirmPassword = true;
+
+  @override
+  void dispose() {
+    fullNameController.dispose();
+    phoneController.dispose();
+    emailController.dispose();
+    passwordController.dispose();
+    confirmPasswordController.dispose();
+    super.dispose();
+  }
+
+  Future<void> _submit() async {
+    if (!_formKey.currentState!.validate()) return;
+
+    try {
+      final email = emailController.text.trim().toLowerCase();
+
+      final response = await Supabase.instance.client.auth.signUp(
+        email: email,
+        password: passwordController.text,
+        data: {
+          'full_name': fullNameController.text.trim(),
+          'phone': phoneController.text.trim(),
+        },
+      );
+
+      if (!mounted) return;
+
+      if (response.user != null) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          const SnackBar(
+            content: Text(
+              'تم إرسال رسالة تأكيد إلى بريدك الإلكتروني. '
+              'يرجى تأكيد البريد لتفعيل الحساب وبدء التجربة المجانية.',
+            ),
+          ),
+        );
+
+        Navigator.pop(context);
+      } else {
+        ScaffoldMessenger.of(context).showSnackBar(
+          const SnackBar(
+            content: Text('تعذر إنشاء الحساب. يرجى المحاولة مجددًا.'),
+          ),
+        );
+      }
+    } on AuthException catch (e) {
+      if (!mounted) return;
+
+      ScaffoldMessenger.of(
+        context,
+      ).showSnackBar(SnackBar(content: Text('فشل إنشاء الحساب: ${e.message}')));
+    } catch (e) {
+      if (!mounted) return;
+
+      debugPrint('REGISTER ERROR: $e');
+
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(content: Text('حدث خطأ أثناء إنشاء الحساب.')),
+      );
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final theme = Theme.of(context);
+
+    return Scaffold(
+      appBar: AppBar(title: const Text('إنشاء حساب جديد'), centerTitle: true),
+      body: SafeArea(
+        child: Center(
+          child: SingleChildScrollView(
+            padding: const EdgeInsets.all(20),
+            child: ConstrainedBox(
+              constraints: const BoxConstraints(maxWidth: 460),
+              child: Card(
+                child: Padding(
+                  padding: const EdgeInsets.all(22),
+                  child: Form(
+                    key: _formKey,
+                    child: Column(
+                      crossAxisAlignment: CrossAxisAlignment.stretch,
+                      children: [
+                        Icon(
+                          Icons.person_add_alt_1_rounded,
+                          size: 65,
+                          color: theme.colorScheme.primary,
+                        ),
+                        const SizedBox(height: 14),
+                        const Text(
+                          'إنشاء حساب جديد',
+                          textAlign: TextAlign.center,
+                          style: TextStyle(
+                            fontSize: 24,
+                            fontWeight: FontWeight.bold,
+                          ),
+                        ),
+                        const SizedBox(height: 8),
+                        Text(
+                          'أدخل بياناتك لإنشاء حساب وإعداد شبكتك.',
+                          textAlign: TextAlign.center,
+                          style: TextStyle(
+                            color: theme.colorScheme.onSurfaceVariant,
+                          ),
+                        ),
+                        const SizedBox(height: 28),
+
+                        TextFormField(
+                          controller: fullNameController,
+                          textInputAction: TextInputAction.next,
+                          decoration: const InputDecoration(
+                            labelText: 'الاسم الكامل',
+                            prefixIcon: Icon(Icons.person_outline),
+                          ),
+                          validator: (value) {
+                            if ((value ?? '').trim().length < 3) {
+                              return 'يرجى إدخال الاسم الكامل';
+                            }
+                            return null;
+                          },
+                        ),
+                        const SizedBox(height: 15),
+
+                        TextFormField(
+                          controller: phoneController,
+                          keyboardType: TextInputType.phone,
+                          textInputAction: TextInputAction.next,
+                          decoration: const InputDecoration(
+                            labelText: 'رقم الهاتف',
+                            prefixIcon: Icon(Icons.phone_outlined),
+                          ),
+                          validator: (value) {
+                            final phone = (value ?? '').trim();
+                            if (!RegExp(r'^\+?[0-9]{7,15}$').hasMatch(phone)) {
+                              return 'يرجى إدخال رقم هاتف صحيح';
+                            }
+                            return null;
+                          },
+                        ),
+                        const SizedBox(height: 15),
+
+                        TextFormField(
+                          controller: emailController,
+                          keyboardType: TextInputType.emailAddress,
+                          textInputAction: TextInputAction.next,
+                          decoration: const InputDecoration(
+                            labelText: 'البريد الإلكتروني',
+                            prefixIcon: Icon(Icons.email_outlined),
+                          ),
+                          validator: (value) {
+                            final email = (value ?? '').trim();
+                            if (!RegExp(r'^[^@\s]+@[^@\s]+\.[^@\s]+$')
+                                .hasMatch(email)) {
+                              return 'يرجى إدخال بريد إلكتروني صحيح';
+                            }
+                            return null;
+                          },
+                        ),
+                        const SizedBox(height: 15),
+
+                        TextFormField(
+                          controller: passwordController,
+                          obscureText: hidePassword,
+                          textInputAction: TextInputAction.next,
+                          decoration: InputDecoration(
+                            labelText: 'كلمة السر',
+                            prefixIcon: const Icon(Icons.lock_outline),
+                            suffixIcon: IconButton(
+                              onPressed: () {
+                                setState(() {
+                                  hidePassword = !hidePassword;
+                                });
+                              },
+                              icon: Icon(
+                                hidePassword
+                                    ? Icons.visibility_outlined
+                                    : Icons.visibility_off_outlined,
+                              ),
+                            ),
+                          ),
+                          validator: (value) {
+                            if ((value ?? '').length < 8) {
+                              return 'كلمة السر يجب ألا تقل عن 8 أحرف';
+                            }
+                            return null;
+                          },
+                        ),
+                        const SizedBox(height: 15),
+
+                        TextFormField(
+                          controller: confirmPasswordController,
+                          obscureText: hideConfirmPassword,
+                          textInputAction: TextInputAction.done,
+                          decoration: InputDecoration(
+                            labelText: 'تأكيد كلمة السر',
+                            prefixIcon: const Icon(Icons.lock_reset_outlined),
+                            suffixIcon: IconButton(
+                              onPressed: () {
+                                setState(() {
+                                  hideConfirmPassword = !hideConfirmPassword;
+                                });
+                              },
+                              icon: Icon(
+                                hideConfirmPassword
+                                    ? Icons.visibility_outlined
+                                    : Icons.visibility_off_outlined,
+                              ),
+                            ),
+                          ),
+                          validator: (value) {
+                            if (value != passwordController.text) {
+                              return 'كلمتا السر غير متطابقتين';
+                            }
+                            return null;
+                          },
+                        ),
+                        const SizedBox(height: 26),
+
+                        SizedBox(
+                          height: 52,
+                          child: FilledButton.icon(
+                            onPressed: _submit,
+                            icon: const Icon(Icons.person_add),
+                            label: const Text('إنشاء الحساب'),
+                          ),
+                        ),
+                        const SizedBox(height: 12),
+
+                        TextButton(
+                          onPressed: () => Navigator.pop(context),
+                          child: const Text('لديك حساب بالفعل؟ تسجيل الدخول'),
+                        ),
+                      ],
+                    ),
                   ),
                 ),
               ),
@@ -3254,6 +4114,19 @@ class _DashboardPageState extends State<DashboardPage> {
                     Navigator.pop(context);
                   },
                 ),
+              if (widget.currentUser.role == 'مدير')
+                ListTile(
+                  selected: selectedIndex == 22,
+                  leading: const Icon(Icons.hub_outlined),
+                  title: const Text('إدارة شبكات MikroTik'),
+                  onTap: () {
+                    setState(() {
+                      selectedIndex = 22;
+                    });
+                    Navigator.pop(context);
+                  },
+                ),
+
               ListTile(
                 selected: selectedIndex == 2,
                 leading: const Icon(Icons.router),
@@ -3484,7 +4357,11 @@ class _DashboardPageState extends State<DashboardPage> {
           child: Stack(
             children: [
               Positioned.fill(
-                child: selectedIndex == 0
+                child: selectedIndex == 22
+                    ? widget.currentUser.role == 'مدير'
+                          ? buildMikrotikNetworks()
+                          : buildDashboard()
+                    : selectedIndex == 0
                     ? buildDashboard()
                     : selectedIndex == 1
                     ? buildUsers()
@@ -3539,6 +4416,22 @@ class _DashboardPageState extends State<DashboardPage> {
                     : selectedIndex == 20
                     ? hasAccountingAccess()
                           ? buildAccountingVouchers()
+                          : buildDashboard()
+                    : selectedIndex == 21
+                    ? hasAccountingAccess()
+                          ? buildAccountingStatementPage()
+                          : buildDashboard()
+                    : selectedIndex == 23
+                    ? hasAccountingAccess()
+                          ? buildAccountingReports()
+                          : buildDashboard()
+                    : selectedIndex == 24
+                    ? hasAccountingAccess()
+                          ? buildAccountingExpenses()
+                          : buildDashboard()
+                    : selectedIndex == 25
+                    ? hasAccountingAccess()
+                          ? buildAccountingCashbox()
                           : buildDashboard()
                     : buildUserDevices(),
               ),
@@ -4415,8 +5308,17 @@ class _DashboardPageState extends State<DashboardPage> {
           return bDate.compareTo(aDate);
         });
 
-        // فواتير المبيعات ستتم إضافتها لاحقاً.
-        sales = [];
+        final salesData = await Supabase.instance.client
+            .from('accounting_sales')
+            .select()
+            .eq('customer_id', customerId)
+            .eq('created_by', widget.currentUser.id);
+
+        sales = List<Map<String, dynamic>>.from(salesData)
+            .where(
+              (sale) => sale['status']?.toString().toLowerCase() != 'cancelled',
+            )
+            .toList();
       } catch (e) {
         if (!mounted) return;
 
@@ -4572,37 +5474,62 @@ class _DashboardPageState extends State<DashboardPage> {
               });
             }
 
+            double openingUsd = 0;
+            double openingSyp = 0;
+
             final openingBalance =
                 (customer['opening_balance'] as num?)?.toDouble() ?? 0;
 
-            double salesDebt = 0;
-
-            for (final sale in sales) {
-              final total = (sale['total'] as num?)?.toDouble() ?? 0;
-              final paid = (sale['paid_amount'] as num?)?.toDouble() ?? 0;
-
-              salesDebt += total - paid;
+            if (currency == 'SYP') {
+              openingSyp = openingBalance;
+            } else {
+              openingUsd = openingBalance;
             }
 
-            double receipts = 0;
-            double customerPayments = 0;
+            double salesDebtUsd = 0;
+            double salesDebtSyp = 0;
+
+            for (final sale in sales) {
+              salesDebtUsd +=
+                  ((sale['total_usd'] as num?)?.toDouble() ?? 0) -
+                  ((sale['paid_usd'] as num?)?.toDouble() ?? 0);
+
+              salesDebtSyp +=
+                  ((sale['total_syp'] as num?)?.toDouble() ?? 0) -
+                  ((sale['paid_syp'] as num?)?.toDouble() ?? 0);
+            }
+
+            double receiptsUsd = 0;
+            double receiptsSyp = 0;
+            double paymentsUsd = 0;
+            double paymentsSyp = 0;
 
             for (final transaction in transactions) {
               final amount = (transaction['amount'] as num?)?.toDouble() ?? 0;
-
               final type = transaction['transaction_type']?.toString() ?? '';
+              final transactionCurrency =
+                  transaction['currency']?.toString() ?? '';
 
-              if (type == 'customer_receipt') {
-                receipts += amount;
-              } else if (type == 'customer_payment') {
-                customerPayments += amount;
+              if (transactionCurrency == 'USD') {
+                if (type == 'customer_receipt') {
+                  receiptsUsd += amount;
+                } else if (type == 'customer_payment') {
+                  paymentsUsd += amount;
+                }
+              } else if (transactionCurrency == 'SYP') {
+                if (type == 'customer_receipt') {
+                  receiptsSyp += amount;
+                } else if (type == 'customer_payment') {
+                  paymentsSyp += amount;
+                }
               }
             }
 
-            // موجب = على الزبون
-            // سالب = للزبون
-            final currentBalance =
-                openingBalance + salesDebt - receipts + customerPayments;
+            final balanceUsd =
+                openingUsd + salesDebtUsd - receiptsUsd + paymentsUsd;
+
+            final balanceSyp =
+                openingSyp + salesDebtSyp - receiptsSyp + paymentsSyp;
 
             final entries = <Map<String, dynamic>>[];
 
@@ -4626,13 +5553,59 @@ class _DashboardPageState extends State<DashboardPage> {
               final aDate =
                   DateTime.tryParse(a['_date']?.toString() ?? '') ??
                   DateTime.fromMillisecondsSinceEpoch(0);
-
               final bDate =
                   DateTime.tryParse(b['_date']?.toString() ?? '') ??
                   DateTime.fromMillisecondsSinceEpoch(0);
-
-              return bDate.compareTo(aDate);
+              return aDate.compareTo(bDate);
             });
+
+            double runningUsd = openingUsd;
+            double runningSyp = openingSyp;
+
+            for (final entry in entries) {
+              double debitUsd = 0;
+              double creditUsd = 0;
+              double debitSyp = 0;
+              double creditSyp = 0;
+
+              if (entry['_kind'] == 'sale') {
+                debitUsd =
+                    ((entry['total_usd'] as num?)?.toDouble() ?? 0) -
+                    ((entry['paid_usd'] as num?)?.toDouble() ?? 0);
+
+                debitSyp =
+                    ((entry['total_syp'] as num?)?.toDouble() ?? 0) -
+                    ((entry['paid_syp'] as num?)?.toDouble() ?? 0);
+              } else {
+                final amount = (entry['amount'] as num?)?.toDouble() ?? 0;
+                final type = entry['transaction_type']?.toString() ?? '';
+                final code = entry['currency']?.toString().toUpperCase() ?? '';
+
+                if (code == 'USD') {
+                  if (type == 'customer_receipt') {
+                    creditUsd = amount;
+                  } else if (type == 'customer_payment') {
+                    debitUsd = amount;
+                  }
+                } else if (code == 'SYP') {
+                  if (type == 'customer_receipt') {
+                    creditSyp = amount;
+                  } else if (type == 'customer_payment') {
+                    debitSyp = amount;
+                  }
+                }
+              }
+
+              runningUsd += debitUsd - creditUsd;
+              runningSyp += debitSyp - creditSyp;
+
+              entry['_debitUsd'] = debitUsd;
+              entry['_creditUsd'] = creditUsd;
+              entry['_debitSyp'] = debitSyp;
+              entry['_creditSyp'] = creditSyp;
+              entry['_balanceUsd'] = runningUsd;
+              entry['_balanceSyp'] = runningSyp;
+            }
 
             String formatStatementDate(dynamic value) {
               final date = DateTime.tryParse(value?.toString() ?? '');
@@ -4671,8 +5644,9 @@ class _DashboardPageState extends State<DashboardPage> {
                             value,
                             style: const TextStyle(
                               fontWeight: FontWeight.bold,
-                              fontSize: 16,
+                              fontSize: 14,
                             ),
+                            softWrap: true,
                           ),
                         ],
                       ),
@@ -4713,104 +5687,6 @@ class _DashboardPageState extends State<DashboardPage> {
                     ? const Center(child: CircularProgressIndicator())
                     : Column(
                         children: [
-                          LayoutBuilder(
-                            builder: (context, constraints) {
-                              final boxes = [
-                                summaryBox(
-                                  isArabic
-                                      ? 'الرصيد الافتتاحي'
-                                      : 'Opening Balance',
-                                  '${openingBalance.toStringAsFixed(2)} $currency',
-                                  Icons.flag_outlined,
-                                ),
-                                summaryBox(
-                                  isArabic ? 'مبيعات آجلة' : 'Sales Due',
-                                  '${salesDebt.toStringAsFixed(2)} $currency',
-                                  Icons.receipt_long_outlined,
-                                ),
-                                summaryBox(
-                                  isArabic
-                                      ? 'إجمالي المقبوض'
-                                      : 'Total Received',
-                                  '${receipts.toStringAsFixed(2)} $currency',
-                                  Icons.south_west_rounded,
-                                ),
-                                summaryBox(
-                                  isArabic
-                                      ? 'الرصيد الحالي'
-                                      : 'Current Balance',
-                                  '${currentBalance.abs().toStringAsFixed(2)} $currency '
-                                  '${currentBalance > 0
-                                      ? (isArabic ? 'عليه' : 'Due')
-                                      : currentBalance < 0
-                                      ? (isArabic ? 'له' : 'Credit')
-                                      : ''}',
-                                  Icons.account_balance_wallet_outlined,
-                                ),
-                              ];
-
-                              if (constraints.maxWidth >= 700) {
-                                return Row(
-                                  children: [
-                                    for (var i = 0; i < boxes.length; i++) ...[
-                                      Expanded(child: boxes[i]),
-                                      if (i < boxes.length - 1)
-                                        const SizedBox(width: 8),
-                                    ],
-                                  ],
-                                );
-                              }
-
-                              return Column(
-                                children: [
-                                  for (var i = 0; i < boxes.length; i++) ...[
-                                    boxes[i],
-                                    if (i < boxes.length - 1)
-                                      const SizedBox(height: 8),
-                                  ],
-                                ],
-                              );
-                            },
-                          ),
-
-                          const SizedBox(height: 14),
-
-                          Row(
-                            children: [
-                              Expanded(
-                                child: FilledButton.icon(
-                                  onPressed: () => addPayment(
-                                    receipt: true,
-                                    setDialogState: setDialogState,
-                                    statementContext: statementContext,
-                                  ),
-                                  icon: const Icon(Icons.south_west_rounded),
-                                  label: Text(
-                                    isArabic
-                                        ? 'قبض من الزبون'
-                                        : 'Receive Payment',
-                                  ),
-                                ),
-                              ),
-                              const SizedBox(width: 10),
-                              Expanded(
-                                child: OutlinedButton.icon(
-                                  onPressed: () => addPayment(
-                                    receipt: false,
-                                    setDialogState: setDialogState,
-                                    statementContext: statementContext,
-                                  ),
-                                  icon: const Icon(Icons.north_east_rounded),
-                                  label: Text(
-                                    isArabic ? 'دفع للزبون' : 'Pay Customer',
-                                  ),
-                                ),
-                              ),
-                            ],
-                          ),
-
-                          const SizedBox(height: 14),
-
                           Expanded(
                             child: entries.isEmpty
                                 ? Center(
@@ -4820,99 +5696,225 @@ class _DashboardPageState extends State<DashboardPage> {
                                           : 'No account transactions yet',
                                     ),
                                   )
-                                : ListView.separated(
-                                    itemCount: entries.length,
-                                    separatorBuilder: (_, _) =>
-                                        const Divider(height: 1),
-                                    itemBuilder: (context, index) {
-                                      final entry = entries[index];
+                                : LayoutBuilder(
+                                    builder: (context, constraints) {
+                                      const minTableWidth = 900.0;
 
-                                      if (entry['_kind'] == 'sale') {
-                                        final total =
-                                            (entry['total'] as num?)
-                                                ?.toDouble() ??
-                                            0;
+                                      return SingleChildScrollView(
+                                        scrollDirection: Axis.horizontal,
+                                        child: SizedBox(
+                                          width:
+                                              constraints.maxWidth >
+                                                  minTableWidth
+                                              ? constraints.maxWidth
+                                              : minTableWidth,
+                                          child: Column(
+                                            children: [
+                                              Container(
+                                                padding: const EdgeInsets.all(
+                                                  10,
+                                                ),
+                                                color: Theme.of(context)
+                                                    .colorScheme
+                                                    .surfaceContainerHighest,
+                                                child: const Row(
+                                                  children: [
+                                                    SizedBox(
+                                                      width: 125,
+                                                      child: Text('التاريخ'),
+                                                    ),
+                                                    SizedBox(
+                                                      width: 145,
+                                                      child: Text('المستند'),
+                                                    ),
+                                                    Expanded(
+                                                      child: Text('البيان'),
+                                                    ),
+                                                    SizedBox(
+                                                      width: 125,
+                                                      child: Text('مدين'),
+                                                    ),
+                                                    SizedBox(
+                                                      width: 125,
+                                                      child: Text('دائن'),
+                                                    ),
+                                                    SizedBox(
+                                                      width: 145,
+                                                      child: Text('الرصيد'),
+                                                    ),
+                                                  ],
+                                                ),
+                                              ),
+                                              Expanded(
+                                                child: ListView.separated(
+                                                  itemCount: entries.length,
+                                                  separatorBuilder: (_, _) =>
+                                                      const Divider(height: 1),
+                                                  itemBuilder: (context, index) {
+                                                    final entry =
+                                                        entries[index];
+                                                    final isSale =
+                                                        entry['_kind'] ==
+                                                        'sale';
+                                                    final type =
+                                                        entry['transaction_type']
+                                                            ?.toString() ??
+                                                        '';
 
-                                        final paid =
-                                            (entry['paid_amount'] as num?)
-                                                ?.toDouble() ??
-                                            0;
+                                                    final document = isSale
+                                                        ? 'مبيعات #${entry['invoice_number'] ?? ''}'
+                                                        : type ==
+                                                              'customer_receipt'
+                                                        ? 'سند قبض'
+                                                        : 'سند دفع';
 
-                                        final due = total - paid;
+                                                    final notes =
+                                                        entry['notes']
+                                                            ?.toString()
+                                                            .trim() ??
+                                                        '';
 
-                                        return ListTile(
-                                          leading: const CircleAvatar(
-                                            child: Icon(Icons.receipt_long),
-                                          ),
-                                          title: Text(
-                                            '${isArabic ? 'فاتورة مبيعات' : 'Sales Invoice'} '
-                                            '#${entry['invoice_number'] ?? ''}',
-                                          ),
-                                          subtitle: Text(
-                                            formatStatementDate(
-                                              entry['invoice_date'],
-                                            ),
-                                          ),
-                                          trailing: Text(
-                                            '+${due.toStringAsFixed(2)} $currency',
-                                            style: const TextStyle(
-                                              fontWeight: FontWeight.bold,
-                                            ),
-                                          ),
-                                        );
-                                      }
+                                                    final description = isSale
+                                                        ? 'فاتورة مبيعات'
+                                                        : notes.isNotEmpty
+                                                        ? notes
+                                                        : document;
 
-                                      final type =
-                                          entry['transaction_type']
-                                              ?.toString() ??
-                                          '';
+                                                    String amountText(
+                                                      String usdKey,
+                                                      String sypKey,
+                                                    ) {
+                                                      final usd =
+                                                          (entry[usdKey]
+                                                                  as num?)
+                                                              ?.toDouble() ??
+                                                          0;
+                                                      final syp =
+                                                          (entry[sypKey]
+                                                                  as num?)
+                                                              ?.toDouble() ??
+                                                          0;
 
-                                      final amount =
-                                          (entry['amount'] as num?)
-                                              ?.toDouble() ??
-                                          0;
+                                                      return '${usd.toStringAsFixed(2)} USD'
+                                                          '\n${syp.toStringAsFixed(2)} SYP';
+                                                    }
 
-                                      final isReceipt =
-                                          type == 'customer_receipt';
-
-                                      return ListTile(
-                                        leading: CircleAvatar(
-                                          child: Icon(
-                                            isReceipt
-                                                ? Icons.south_west_rounded
-                                                : Icons.north_east_rounded,
-                                          ),
-                                        ),
-                                        title: Text(
-                                          isReceipt
-                                              ? (isArabic
-                                                    ? 'قبض من الزبون'
-                                                    : 'Customer Receipt')
-                                              : (isArabic
-                                                    ? 'دفع للزبون'
-                                                    : 'Customer Payment'),
-                                        ),
-                                        subtitle: Text(
-                                          [
-                                            formatStatementDate(
-                                              entry['transaction_date'],
-                                            ),
-                                            if ((entry['notes']?.toString() ??
-                                                    '')
-                                                .isNotEmpty)
-                                              entry['notes'].toString(),
-                                          ].join(' • '),
-                                        ),
-                                        trailing: Text(
-                                          '${isReceipt ? '-' : '+'}'
-                                          '${amount.toStringAsFixed(2)} $currency',
-                                          style: const TextStyle(
-                                            fontWeight: FontWeight.bold,
+                                                    return Padding(
+                                                      padding:
+                                                          const EdgeInsets.symmetric(
+                                                            horizontal: 10,
+                                                            vertical: 12,
+                                                          ),
+                                                      child: Row(
+                                                        children: [
+                                                          SizedBox(
+                                                            width: 125,
+                                                            child: Text(
+                                                              formatStatementDate(
+                                                                entry['_date'],
+                                                              ),
+                                                            ),
+                                                          ),
+                                                          SizedBox(
+                                                            width: 145,
+                                                            child: Text(
+                                                              document,
+                                                            ),
+                                                          ),
+                                                          Expanded(
+                                                            child: Text(
+                                                              description,
+                                                              maxLines: 2,
+                                                              overflow:
+                                                                  TextOverflow
+                                                                      .ellipsis,
+                                                            ),
+                                                          ),
+                                                          SizedBox(
+                                                            width: 125,
+                                                            child: Text(
+                                                              amountText(
+                                                                '_debitUsd',
+                                                                '_debitSyp',
+                                                              ),
+                                                            ),
+                                                          ),
+                                                          SizedBox(
+                                                            width: 125,
+                                                            child: Text(
+                                                              amountText(
+                                                                '_creditUsd',
+                                                                '_creditSyp',
+                                                              ),
+                                                            ),
+                                                          ),
+                                                          SizedBox(
+                                                            width: 145,
+                                                            child: Text(
+                                                              amountText(
+                                                                '_balanceUsd',
+                                                                '_balanceSyp',
+                                                              ),
+                                                              style: const TextStyle(
+                                                                fontWeight:
+                                                                    FontWeight
+                                                                        .bold,
+                                                              ),
+                                                            ),
+                                                          ),
+                                                        ],
+                                                      ),
+                                                    );
+                                                  },
+                                                ),
+                                              ),
+                                            ],
                                           ),
                                         ),
                                       );
                                     },
                                   ),
+                          ),
+                          const SizedBox(height: 12),
+                          Container(
+                            width: double.infinity,
+                            padding: const EdgeInsets.all(14),
+                            decoration: BoxDecoration(
+                              color: Theme.of(context)
+                                  .colorScheme
+                                  .surfaceContainerHighest,
+                              borderRadius: BorderRadius.circular(12),
+                            ),
+                            child: Column(
+                              crossAxisAlignment: CrossAxisAlignment.start,
+                              children: [
+                                Text(
+                                  isArabic
+                                      ? 'الرصيد الحالي'
+                                      : 'Current Balance',
+                                  style: const TextStyle(
+                                    fontWeight: FontWeight.bold,
+                                  ),
+                                ),
+                                const SizedBox(height: 6),
+                                Text(
+                                  'USD: ${balanceUsd.abs().toStringAsFixed(2)} '
+                                  '${balanceUsd > 0
+                                      ? (isArabic ? 'عليه' : 'Due')
+                                      : balanceUsd < 0
+                                      ? (isArabic ? 'له' : 'Credit')
+                                      : ''}',
+                                ),
+                                Text(
+                                  'SYP: ${balanceSyp.abs().toStringAsFixed(2)} '
+                                  '${balanceSyp > 0
+                                      ? (isArabic ? 'عليه' : 'Due')
+                                      : balanceSyp < 0
+                                      ? (isArabic ? 'له' : 'Credit')
+                                      : ''}',
+                                ),
+                              ],
+                            ),
                           ),
                         ],
                       ),
@@ -5059,8 +6061,7 @@ class _DashboardPageState extends State<DashboardPage> {
 
                       return Card(
                         child: ListTile(
-                          onTap: () =>
-                              showAccountingCustomerStatement(customer),
+                          onTap: null,
                           leading: CircleAvatar(
                             backgroundColor: Theme.of(context)
                                 .colorScheme
@@ -6413,8 +7414,7 @@ class _DashboardPageState extends State<DashboardPage> {
 
                       return Card(
                         child: ListTile(
-                          onTap: () =>
-                              showAccountingSupplierStatement(supplier),
+                          onTap: null,
                           leading: CircleAvatar(
                             backgroundColor: Theme.of(context)
                                 .colorScheme
@@ -8004,6 +9004,18 @@ class _DashboardPageState extends State<DashboardPage> {
   bool accountingPurchasesLoading = false;
   bool accountingSalesLoading = false;
 
+  // Sales invoice filters
+  String accountingSalesSearch = '';
+  DateTime? accountingSalesFromDate;
+  DateTime? accountingSalesToDate;
+  String accountingSalesSort = 'newest';
+
+  // Purchase invoice filters
+  String accountingPurchasesSearch = '';
+  DateTime? accountingPurchasesFromDate;
+  DateTime? accountingPurchasesToDate;
+  String accountingPurchasesSort = 'newest';
+
   Future<void> loadAccountingSales() async {
     if (accountingSalesLoading) return;
 
@@ -9508,6 +10520,27 @@ class _DashboardPageState extends State<DashboardPage> {
                     'status': 'posted',
                   };
 
+                  // الاحتفاظ بتكلفة الأصناف الأصلية عند تعديل الفاتورة.
+                  final originalSaleCosts = <String, double>{};
+
+                  if (isEditingSale) {
+                    final oldSaleId = existingSale['id']?.toString() ?? '';
+
+                    final oldItems = await Supabase.instance.client
+                        .from('accounting_sale_items')
+                        .select('product_id,unit_cost')
+                        .eq('sale_id', oldSaleId);
+
+                    for (final oldItem in oldItems) {
+                      final productId = oldItem['product_id']?.toString() ?? '';
+                      final cost = oldItem['unit_cost'];
+
+                      if (productId.isNotEmpty && cost is num) {
+                        originalSaleCosts[productId] = cost.toDouble();
+                      }
+                    }
+                  }
+
                   String saleId;
                   dynamic invoiceNumber;
 
@@ -9592,8 +10625,11 @@ class _DashboardPageState extends State<DashboardPage> {
                       discountPercent = 100;
                     }
 
+                    final productId = product['id']?.toString() ?? '';
+
                     final unitCost =
-                        (product['purchase_price'] as num?)?.toDouble() ?? 0;
+                        originalSaleCosts[productId] ??
+                        ((product['purchase_price'] as num?)?.toDouble() ?? 0);
 
                     final currency = row['priceCurrency']?.toString() ?? 'USD';
 
@@ -11347,6 +12383,46 @@ class _DashboardPageState extends State<DashboardPage> {
       label: Text(isArabic ? 'فاتورة جديدة' : 'New Invoice'),
     );
 
+    final filteredSales = accountingSales
+        .where((sale) {
+          final query = accountingSalesSearch.trim().toLowerCase();
+          if (query.isEmpty) return true;
+
+          final number = sale['invoice_number']?.toString().toLowerCase() ?? '';
+          final party = (customerNameForSale(sale)).toLowerCase();
+
+          return number.contains(query) || party.contains(query);
+        })
+        .where((sale) {
+          final raw = sale['invoice_date']?.toString();
+          final date = raw == null ? null : DateTime.tryParse(raw);
+          if (date == null)
+            return accountingSalesFromDate == null &&
+                accountingSalesToDate == null;
+          final day = DateTime(date.year, date.month, date.day);
+          if (accountingSalesFromDate != null &&
+              day.isBefore(accountingSalesFromDate!))
+            return false;
+          if (accountingSalesToDate != null &&
+              day.isAfter(accountingSalesToDate!))
+            return false;
+          return true;
+        })
+        .toList();
+
+    filteredSales.sort((a, b) {
+      if (accountingSalesSort == 'amount_desc') {
+        final av = (a['total_usd'] as num?)?.toDouble() ?? 0;
+        final bv = (b['total_usd'] as num?)?.toDouble() ?? 0;
+        return bv.compareTo(av);
+      }
+      final av = a['invoice_date']?.toString() ?? '';
+      final bv = b['invoice_date']?.toString() ?? '';
+      return accountingSalesSort == 'oldest'
+          ? av.compareTo(bv)
+          : bv.compareTo(av);
+    });
+
     return Padding(
       padding: EdgeInsets.all(isMobile ? 12 : 20),
       child: Column(
@@ -11383,6 +12459,91 @@ class _DashboardPageState extends State<DashboardPage> {
             const SizedBox(height: 10),
             SizedBox(width: double.infinity, child: newInvoiceButton),
           ],
+          TextField(
+            decoration: const InputDecoration(
+              prefixIcon: Icon(Icons.search),
+              labelText: 'ابحث برقم الفاتورة أو اسم العميل',
+              border: OutlineInputBorder(),
+              isDense: true,
+            ),
+            onChanged: (value) {
+              setState(() => accountingSalesSearch = value);
+            },
+          ),
+          const SizedBox(height: 12),
+          Wrap(
+            spacing: 8,
+            runSpacing: 8,
+            children: [
+              OutlinedButton.icon(
+                icon: const Icon(Icons.event),
+                label: Text(
+                  accountingSalesFromDate == null
+                      ? 'من تاريخ'
+                      : 'من: ${accountingSalesFromDate!.year}/${accountingSalesFromDate!.month}/${accountingSalesFromDate!.day}',
+                ),
+                onPressed: () async {
+                  final date = await showDatePicker(
+                    context: context,
+                    initialDate: accountingSalesFromDate ?? DateTime.now(),
+                    firstDate: DateTime(2000),
+                    lastDate: accountingSalesToDate ?? DateTime(2100),
+                  );
+                  if (date == null || !mounted) return;
+                  setState(() => accountingSalesFromDate = date);
+                },
+              ),
+              OutlinedButton.icon(
+                icon: const Icon(Icons.event),
+                label: Text(
+                  accountingSalesToDate == null
+                      ? 'إلى تاريخ'
+                      : 'إلى: ${accountingSalesToDate!.year}/${accountingSalesToDate!.month}/${accountingSalesToDate!.day}',
+                ),
+                onPressed: () async {
+                  final date = await showDatePicker(
+                    context: context,
+                    initialDate: accountingSalesToDate ?? DateTime.now(),
+                    firstDate: accountingSalesFromDate ?? DateTime(2000),
+                    lastDate: DateTime(2100),
+                  );
+                  if (date == null || !mounted) return;
+                  setState(() => accountingSalesToDate = date);
+                },
+              ),
+              DropdownButton<String>(
+                value: accountingSalesSort,
+                items: const [
+                  DropdownMenuItem(
+                    value: 'newest',
+                    child: Text('الأحدث أولًا'),
+                  ),
+                  DropdownMenuItem(
+                    value: 'oldest',
+                    child: Text('الأقدم أولًا'),
+                  ),
+                  DropdownMenuItem(
+                    value: 'amount_desc',
+                    child: Text('الأعلى مبلغًا USD'),
+                  ),
+                ],
+                onChanged: (value) {
+                  if (value != null)
+                    setState(() => accountingSalesSort = value);
+                },
+              ),
+              IconButton(
+                tooltip: 'إعادة ضبط الفلاتر',
+                icon: const Icon(Icons.restart_alt),
+                onPressed: () => setState(() {
+                  accountingSalesFromDate = null;
+                  accountingSalesToDate = null;
+                  accountingSalesSort = 'newest';
+                }),
+              ),
+            ],
+          ),
+          const SizedBox(height: 12),
           const SizedBox(height: 20),
 
           // رأس الجدول على الكمبيوتر فقط
@@ -11429,10 +12590,10 @@ class _DashboardPageState extends State<DashboardPage> {
                     ),
                   )
                 : ListView.separated(
-                    itemCount: accountingSales.length,
+                    itemCount: filteredSales.length,
                     separatorBuilder: (_, _) => const Divider(height: 1),
                     itemBuilder: (context, index) {
-                      final sale = accountingSales[index];
+                      final sale = filteredSales[index];
 
                       final number = sale['invoice_number']?.toString() ?? '-';
 
@@ -11605,6 +12766,41 @@ class _DashboardPageState extends State<DashboardPage> {
       ),
     );
   }
+
+  Widget _voucherDetailRow(IconData icon, String label, String value) {
+    return Padding(
+      padding: const EdgeInsets.only(bottom: 14),
+      child: Row(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Icon(icon, size: 21, color: Colors.grey.shade600),
+          const SizedBox(width: 12),
+          SizedBox(
+            width: 105,
+            child: Text(
+              label,
+              style: TextStyle(
+                color: Colors.grey.shade600,
+                fontWeight: FontWeight.w500,
+              ),
+            ),
+          ),
+          Expanded(
+            child: Text(
+              value,
+              style: const TextStyle(fontWeight: FontWeight.w600),
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+
+  DateTime? vouchersFromDate;
+  DateTime? vouchersToDate;
+
+  String vouchersSearchQuery = '';
+  String vouchersTypeFilter = 'all';
 
   Widget buildAccountingVouchers() {
     final ar = widget.currentUser.language == 'ar';
@@ -12329,25 +13525,138 @@ class _DashboardPageState extends State<DashboardPage> {
             children: [
               FilledButton.icon(
                 onPressed: () => createVoucher(true),
-                icon: const Icon(Icons.add_circle_outline),
-                label: Text(ar ? 'سند قبض جديد' : 'New Receipt'),
+                style: FilledButton.styleFrom(
+                  backgroundColor: Colors.green.shade700,
+                  foregroundColor: Colors.white,
+                  padding: const EdgeInsets.symmetric(
+                    horizontal: 24,
+                    vertical: 18,
+                  ),
+                  shape: RoundedRectangleBorder(
+                    borderRadius: BorderRadius.circular(16),
+                  ),
+                ),
+                icon: const Icon(Icons.south_west_rounded, size: 30),
+                label: Text(
+                  ar ? 'سند قبض جديد' : 'New Receipt',
+                  style: const TextStyle(
+                    fontSize: 17,
+                    fontWeight: FontWeight.bold,
+                  ),
+                ),
               ),
-              FilledButton.tonalIcon(
+              FilledButton.icon(
                 onPressed: () => createVoucher(false),
-                icon: const Icon(Icons.remove_circle_outline),
-                label: Text(ar ? 'سند صرف جديد' : 'New Payment'),
+                style: FilledButton.styleFrom(
+                  backgroundColor: Colors.deepOrange.shade600,
+                  foregroundColor: Colors.white,
+                  padding: const EdgeInsets.symmetric(
+                    horizontal: 24,
+                    vertical: 18,
+                  ),
+                  shape: RoundedRectangleBorder(
+                    borderRadius: BorderRadius.circular(16),
+                  ),
+                ),
+                icon: const Icon(Icons.north_east_rounded, size: 30),
+                label: Text(
+                  ar ? 'سند صرف جديد' : 'New Payment',
+                  style: const TextStyle(
+                    fontSize: 17,
+                    fontWeight: FontWeight.bold,
+                  ),
+                ),
               ),
             ],
           ),
-          const SizedBox(height: 20),
+          const SizedBox(height: 12),
+          Align(
+            alignment: AlignmentDirectional.centerEnd,
+            child: FilledButton.icon(
+              onPressed: () {
+                setState(() {});
+              },
+              style: FilledButton.styleFrom(
+                backgroundColor: Colors.green.shade700,
+                foregroundColor: Colors.white,
+                padding: const EdgeInsets.symmetric(
+                  horizontal: 20,
+                  vertical: 14,
+                ),
+                shape: RoundedRectangleBorder(
+                  borderRadius: BorderRadius.circular(14),
+                ),
+              ),
+              icon: const Icon(Icons.refresh_rounded, size: 25),
+              label: Text(ar ? 'تحديث السندات' : 'Refresh Vouchers'),
+            ),
+          ),
+          const SizedBox(height: 12),
           Expanded(
             child: FutureBuilder(
-              future: db
-                  .from('accounting_transactions')
-                  .select()
-                  .eq('created_by', widget.currentUser.id)
-                  .not('voucher_type', 'is', null)
-                  .order('transaction_date', ascending: false),
+              future: () async {
+                final transactions = await db
+                    .from('accounting_transactions')
+                    .select()
+                    .eq('created_by', widget.currentUser.id)
+                    .not('voucher_type', 'is', null)
+                    .order('transaction_date', ascending: false);
+
+                final items = List<Map<String, dynamic>>.from(transactions);
+
+                final customerIds = items
+                    .map((e) => e['customer_id']?.toString())
+                    .whereType<String>()
+                    .where((id) => id.isNotEmpty)
+                    .toSet()
+                    .toList();
+
+                final supplierIds = items
+                    .map((e) => e['supplier_id']?.toString())
+                    .whereType<String>()
+                    .where((id) => id.isNotEmpty)
+                    .toSet()
+                    .toList();
+
+                final names = <String, String>{};
+
+                if (customerIds.isNotEmpty) {
+                  final customers = await db
+                      .from('accounting_customers')
+                      .select('id, name')
+                      .inFilter('id', customerIds);
+
+                  for (final customer in customers) {
+                    names[customer['id'].toString()] =
+                        customer['name']?.toString() ?? '';
+                  }
+                }
+
+                if (supplierIds.isNotEmpty) {
+                  final suppliers = await db
+                      .from('accounting_suppliers')
+                      .select('id, name')
+                      .inFilter('id', supplierIds);
+
+                  for (final supplier in suppliers) {
+                    names[supplier['id'].toString()] =
+                        supplier['name']?.toString() ?? '';
+                  }
+                }
+
+                for (final item in items) {
+                  final customerId = item['customer_id']?.toString();
+                  final supplierId = item['supplier_id']?.toString();
+
+                  final resolvedName = names[customerId] ?? names[supplierId];
+
+                  if (resolvedName != null && resolvedName.trim().isNotEmpty) {
+                    item['party_name'] = resolvedName;
+                  }
+                }
+
+                return items;
+              }(),
               builder: (context, snapshot) {
                 if (snapshot.connectionState != ConnectionState.done) {
                   return const Center(child: CircularProgressIndicator());
@@ -12361,6 +13670,340 @@ class _DashboardPageState extends State<DashboardPage> {
                   snapshot.data ?? [],
                 );
 
+                final filteredItems = items.where((item) {
+                  final voucherType = item['voucher_type']?.toString() ?? '';
+
+                  if (vouchersTypeFilter != 'all' &&
+                      voucherType != vouchersTypeFilter) {
+                    return false;
+                  }
+
+                  final query = vouchersSearchQuery.trim().toLowerCase();
+
+                  if (query.isNotEmpty) {
+                    final searchableText =
+                        [
+                              item['voucher_number'],
+                              item['party_name'],
+                              item['notes'],
+                              item['description'],
+                            ]
+                            .map((value) => value?.toString() ?? '')
+                            .join(' ')
+                            .toLowerCase();
+
+                    if (!searchableText.contains(query)) {
+                      return false;
+                    }
+                  }
+
+                  final raw = item['transaction_date']?.toString();
+                  final date = raw == null
+                      ? null
+                      : DateTime.tryParse(raw)?.toLocal();
+
+                  if (date == null) {
+                    return vouchersFromDate == null && vouchersToDate == null;
+                  }
+
+                  final day = DateTime(date.year, date.month, date.day);
+
+                  if (vouchersFromDate != null) {
+                    final from = vouchersFromDate!;
+                    if (day.isBefore(
+                      DateTime(from.year, from.month, from.day),
+                    )) {
+                      return false;
+                    }
+                  }
+
+                  if (vouchersToDate != null) {
+                    final to = vouchersToDate!;
+                    if (day.isAfter(DateTime(to.year, to.month, to.day))) {
+                      return false;
+                    }
+                  }
+
+                  return true;
+                }).toList();
+
+                double receiptUsd = 0;
+                double receiptSyp = 0;
+                double paymentUsd = 0;
+                double paymentSyp = 0;
+
+                for (final item in filteredItems) {
+                  final amount =
+                      (item['amount'] as num?)?.toDouble() ??
+                      double.tryParse(item['amount']?.toString() ?? '') ??
+                      0;
+
+                  final receipt = item['voucher_type'] == 'receipt';
+                  final currency = item['currency']?.toString().toUpperCase();
+
+                  if (receipt && currency == 'USD') {
+                    receiptUsd += amount;
+                  } else if (receipt && currency == 'SYP') {
+                    receiptSyp += amount;
+                  } else if (!receipt && currency == 'USD') {
+                    paymentUsd += amount;
+                  } else if (!receipt && currency == 'SYP') {
+                    paymentSyp += amount;
+                  }
+                }
+
+                Future<void> printVouchersReport() async {
+                  try {
+                    final regular =
+                        await PdfGoogleFonts.notoNaskhArabicRegular();
+                    final bold = await PdfGoogleFonts.notoNaskhArabicBold();
+
+                    final document = pw.Document();
+                    final issuedAt = DateTime.now();
+
+                    String formatReportDate(DateTime? date) {
+                      if (date == null) return 'الكل';
+                      return '${date.year}/${date.month.toString().padLeft(2, '0')}/${date.day.toString().padLeft(2, '0')}';
+                    }
+
+                    String formatTransactionDate(dynamic raw) {
+                      if (raw == null) return '-';
+                      final date = DateTime.tryParse(raw.toString());
+                      if (date == null) return raw.toString();
+                      return formatReportDate(date.toLocal());
+                    }
+
+                    String formatAmount(dynamic value) {
+                      final amount =
+                          (value as num?)?.toDouble() ??
+                          double.tryParse(value?.toString() ?? '') ??
+                          0;
+                      return amount.toStringAsFixed(2);
+                    }
+
+                    final period =
+                        'من ${formatReportDate(vouchersFromDate)} إلى ${formatReportDate(vouchersToDate)}';
+
+                    final typeLabel = vouchersTypeFilter == 'receipt'
+                        ? 'سندات القبض'
+                        : vouchersTypeFilter == 'payment'
+                        ? 'سندات الصرف'
+                        : 'جميع السندات';
+
+                    pw.Widget summaryLine(
+                      String label,
+                      double usd,
+                      double syp,
+                    ) {
+                      return pw.Container(
+                        padding: const pw.EdgeInsets.symmetric(
+                          vertical: 7,
+                          horizontal: 8,
+                        ),
+                        child: pw.Row(
+                          mainAxisAlignment: pw.MainAxisAlignment.spaceBetween,
+                          children: [
+                            pw.Expanded(
+                              child: pw.Text(
+                                '${usd.toStringAsFixed(2)} USD',
+                                style: pw.TextStyle(
+                                  font: regular,
+                                  fontSize: 11,
+                                ),
+                              ),
+                            ),
+                            pw.Expanded(
+                              child: pw.Text(
+                                '${syp.toStringAsFixed(2)} SYP',
+                                style: pw.TextStyle(
+                                  font: regular,
+                                  fontSize: 11,
+                                ),
+                              ),
+                            ),
+                            pw.Expanded(
+                              child: pw.Text(
+                                label,
+                                textAlign: pw.TextAlign.right,
+                                style: pw.TextStyle(font: bold, fontSize: 11),
+                              ),
+                            ),
+                          ],
+                        ),
+                      );
+                    }
+
+                    document.addPage(
+                      pw.MultiPage(
+                        pageFormat: PdfPageFormat.a4,
+                        margin: const pw.EdgeInsets.all(30),
+                        textDirection: pw.TextDirection.rtl,
+                        header: (context) => pw.Column(
+                          children: [
+                            pw.Center(
+                              child: pw.Text(
+                                'منصة قصر الحجاج',
+                                style: pw.TextStyle(
+                                  font: bold,
+                                  fontSize: 22,
+                                  color: PdfColors.indigo900,
+                                ),
+                              ),
+                            ),
+                            pw.SizedBox(height: 5),
+                            pw.Center(
+                              child: pw.Text(
+                                'تقرير سندات القبض والصرف',
+                                style: pw.TextStyle(font: bold, fontSize: 16),
+                              ),
+                            ),
+                            pw.SizedBox(height: 10),
+                            pw.Row(
+                              mainAxisAlignment:
+                                  pw.MainAxisAlignment.spaceBetween,
+                              children: [
+                                pw.Text(
+                                  'تاريخ الإصدار: ${formatReportDate(issuedAt)}',
+                                  style: pw.TextStyle(
+                                    font: regular,
+                                    fontSize: 10,
+                                  ),
+                                ),
+                                pw.Text(
+                                  period,
+                                  style: pw.TextStyle(
+                                    font: regular,
+                                    fontSize: 10,
+                                  ),
+                                ),
+                              ],
+                            ),
+                            pw.Text(
+                              'نوع السند: $typeLabel',
+                              style: pw.TextStyle(font: regular, fontSize: 10),
+                            ),
+                            pw.Divider(
+                              color: PdfColors.indigo900,
+                              thickness: 1.5,
+                            ),
+                          ],
+                        ),
+                        footer: (context) => pw.Center(
+                          child: pw.Text(
+                            'صفحة ${context.pageNumber} من ${context.pagesCount}',
+                            style: pw.TextStyle(font: regular, fontSize: 9),
+                          ),
+                        ),
+                        build: (context) => [
+                          pw.TableHelper.fromTextArray(
+                            headers: [
+                              'التاريخ',
+                              'رقم السند',
+                              'النوع',
+                              'الجهة',
+                              'المبلغ',
+                              'العملة',
+                            ],
+                            data: filteredItems.map((item) {
+                              final type = item['voucher_type'] == 'receipt'
+                                  ? 'قبض'
+                                  : 'صرف';
+
+                              return [
+                                formatTransactionDate(item['transaction_date']),
+                                item['voucher_number']?.toString() ?? '-',
+                                type,
+                                item['party_name']?.toString() ?? '',
+                                formatAmount(item['amount']),
+                                item['currency']?.toString() ?? '',
+                              ];
+                            }).toList(),
+                            headerStyle: pw.TextStyle(
+                              font: bold,
+                              fontSize: 10,
+                              color: PdfColors.white,
+                            ),
+                            cellStyle: pw.TextStyle(font: regular, fontSize: 9),
+                            cellAlignment: pw.Alignment.center,
+                            headerDecoration: const pw.BoxDecoration(
+                              color: PdfColors.indigo900,
+                            ),
+                            oddRowDecoration: const pw.BoxDecoration(
+                              color: PdfColors.grey100,
+                            ),
+                            border: pw.TableBorder.all(
+                              color: PdfColors.grey400,
+                              width: 0.5,
+                            ),
+                            cellPadding: const pw.EdgeInsets.all(6),
+                          ),
+                          pw.SizedBox(height: 20),
+                          pw.Text(
+                            'الملخص المالي',
+                            style: pw.TextStyle(
+                              font: bold,
+                              fontSize: 15,
+                              color: PdfColors.indigo900,
+                            ),
+                          ),
+                          pw.Divider(),
+                          summaryLine('إجمالي القبض', receiptUsd, receiptSyp),
+                          summaryLine('إجمالي الصرف', paymentUsd, paymentSyp),
+                          pw.Divider(),
+                          summaryLine(
+                            'صافي الحركة',
+                            receiptUsd - paymentUsd,
+                            receiptSyp - paymentSyp,
+                          ),
+                          pw.SizedBox(height: 12),
+                          pw.Text(
+                            'عدد السندات: ${filteredItems.length}',
+                            style: pw.TextStyle(font: bold, fontSize: 11),
+                          ),
+                        ],
+                      ),
+                    );
+
+                    await Printing.layoutPdf(
+                      onLayout: (format) async => document.save(),
+                      name:
+                          'Voucher_Report_${DateTime.now().millisecondsSinceEpoch}',
+                    );
+                  } catch (e) {
+                    if (!mounted) return;
+                    ScaffoldMessenger.of(context).showSnackBar(
+                      SnackBar(content: Text('خطأ في طباعة التقرير: $e')),
+                    );
+                  }
+                }
+
+                Widget amountBox(String title, double value, Color color) {
+                  return Container(
+                    width: 190,
+                    padding: const EdgeInsets.all(14),
+                    decoration: BoxDecoration(
+                      color: color.withValues(alpha: 0.08),
+                      borderRadius: BorderRadius.circular(12),
+                      border: Border.all(color: color.withValues(alpha: 0.25)),
+                    ),
+                    child: Column(
+                      crossAxisAlignment: CrossAxisAlignment.start,
+                      children: [
+                        Text(title, style: const TextStyle(fontSize: 13)),
+                        const SizedBox(height: 6),
+                        Text(
+                          value.toStringAsFixed(2),
+                          style: TextStyle(
+                            fontSize: 20,
+                            fontWeight: FontWeight.bold,
+                            color: color,
+                          ),
+                        ),
+                      ],
+                    ),
+                  );
+                }
+
                 if (items.isEmpty) {
                   return Center(
                     child: Text(
@@ -12369,165 +14012,540 @@ class _DashboardPageState extends State<DashboardPage> {
                   );
                 }
 
-                return ListView.builder(
-                  itemCount: items.length,
-                  itemBuilder: (context, index) {
-                    final item = items[index];
-                    final receipt = item['voucher_type'] == 'receipt';
-                    final amount = item['amount']?.toString() ?? '0';
-                    final currency = item['currency']?.toString() ?? '';
-                    final number = item['voucher_number']?.toString() ?? '-';
-
-                    String partyName = item['party_name']?.toString() ?? '';
-
-                    final customerId = item['customer_id']?.toString();
-
-                    final supplierId = item['supplier_id']?.toString();
-
-                    if (customerId != null) {
-                      for (final customer in accountingCustomers) {
-                        if (customer['id']?.toString() == customerId) {
-                          partyName = customer['name']?.toString() ?? '';
-                          break;
-                        }
-                      }
-                    }
-
-                    if (supplierId != null) {
-                      for (final supplier in accountingSuppliers) {
-                        if (supplier['id']?.toString() == supplierId) {
-                          partyName = supplier['name']?.toString() ?? '';
-                          break;
-                        }
-                      }
-                    }
-
-                    if (partyName.isEmpty) {
-                      partyName = ar ? 'جهة غير محددة' : 'Unknown party';
-                    }
-
-                    return Card(
-                      child: ListTile(
-                        onTap: () {
-                          showDialog(
-                            context: context,
-                            builder: (detailsContext) => AlertDialog(
-                              title: Text(
-                                receipt
-                                    ? (ar
-                                          ? 'تفاصيل سند قبض'
-                                          : 'Receipt Details')
-                                    : (ar
-                                          ? 'تفاصيل سند صرف'
-                                          : 'Payment Details'),
+                return Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    Align(
+                      alignment: AlignmentDirectional.centerEnd,
+                      child: FilledButton.icon(
+                        onPressed: filteredItems.isEmpty
+                            ? null
+                            : printVouchersReport,
+                        icon: const Icon(Icons.picture_as_pdf_rounded),
+                        label: Text(
+                          ar ? 'طباعة تقرير PDF' : 'Print PDF Report',
+                        ),
+                        style: FilledButton.styleFrom(
+                          backgroundColor: Colors.indigo.shade700,
+                          foregroundColor: Colors.white,
+                          padding: const EdgeInsets.symmetric(
+                            horizontal: 20,
+                            vertical: 14,
+                          ),
+                        ),
+                      ),
+                    ),
+                    const SizedBox(height: 12),
+                    Wrap(
+                      spacing: 12,
+                      runSpacing: 12,
+                      crossAxisAlignment: WrapCrossAlignment.center,
+                      children: [
+                        SizedBox(
+                          width: 320,
+                          child: TextFormField(
+                            initialValue: vouchersSearchQuery,
+                            decoration: const InputDecoration(
+                              labelText: 'بحث في السندات',
+                              hintText: 'رقم السند، الجهة، البيان',
+                              prefixIcon: Icon(Icons.search),
+                              border: OutlineInputBorder(),
+                              isDense: true,
+                            ),
+                            onChanged: (value) {
+                              setState(() {
+                                vouchersSearchQuery = value;
+                              });
+                            },
+                          ),
+                        ),
+                        SizedBox(
+                          width: 180,
+                          child: DropdownButtonFormField<String>(
+                            initialValue: vouchersTypeFilter,
+                            decoration: const InputDecoration(
+                              labelText: 'نوع السند',
+                              border: OutlineInputBorder(),
+                              isDense: true,
+                            ),
+                            items: const [
+                              DropdownMenuItem(
+                                value: 'all',
+                                child: Text('جميع السندات'),
                               ),
-                              content: SizedBox(
-                                width: 420,
-                                child: SingleChildScrollView(
-                                  child: Column(
-                                    mainAxisSize: MainAxisSize.min,
-                                    crossAxisAlignment:
-                                        CrossAxisAlignment.start,
-                                    children: [
-                                      Text('رقم السند: $number'),
-                                      const SizedBox(height: 12),
-                                      Text('الجهة: $partyName'),
-                                      const SizedBox(height: 12),
-                                      Text('المبلغ: $amount $currency'),
-                                      const SizedBox(height: 12),
-                                      Text(
-                                        'طريقة الدفع: ${item['payment_method'] == 'transfer' ? 'تحويل' : 'نقدي'}',
-                                      ),
-                                      const SizedBox(height: 12),
-                                      Text(
-                                        'التاريخ: ${item['transaction_date'] ?? ''}',
-                                      ),
-                                      const SizedBox(height: 12),
-                                      Text('البيان: ${item['notes'] ?? ''}'),
-                                    ],
-                                  ),
-                                ),
+                              DropdownMenuItem(
+                                value: 'receipt',
+                                child: Text('سندات القبض'),
                               ),
-                              actions: [
-                                TextButton.icon(
-                                  onPressed: () async {
-                                    Navigator.pop(detailsContext);
-                                    await editAccountingVoucher(item);
-                                  },
-                                  icon: const Icon(Icons.edit),
-                                  label: const Text('تعديل'),
+                              DropdownMenuItem(
+                                value: 'payment',
+                                child: Text('سندات الصرف'),
+                              ),
+                            ],
+                            onChanged: (value) {
+                              if (value != null) {
+                                setState(() {
+                                  vouchersTypeFilter = value;
+                                });
+                              }
+                            },
+                          ),
+                        ),
+                      ],
+                    ),
+                    const SizedBox(height: 12),
+                    Wrap(
+                      spacing: 10,
+                      runSpacing: 10,
+                      crossAxisAlignment: WrapCrossAlignment.center,
+                      children: [
+                        OutlinedButton.icon(
+                          icon: const Icon(Icons.date_range),
+                          label: Text(
+                            vouchersFromDate == null
+                                ? 'من تاريخ'
+                                : 'من: ${vouchersFromDate!.day}/${vouchersFromDate!.month}/${vouchersFromDate!.year}',
+                          ),
+                          onPressed: () async {
+                            final picked = await showDatePicker(
+                              context: context,
+                              initialDate: vouchersFromDate ?? DateTime.now(),
+                              firstDate: DateTime(2020),
+                              lastDate: DateTime(2100),
+                            );
+                            if (picked != null && mounted) {
+                              setState(() => vouchersFromDate = picked);
+                            }
+                          },
+                        ),
+                        OutlinedButton.icon(
+                          icon: const Icon(Icons.event),
+                          label: Text(
+                            vouchersToDate == null
+                                ? 'إلى تاريخ'
+                                : 'إلى: ${vouchersToDate!.day}/${vouchersToDate!.month}/${vouchersToDate!.year}',
+                          ),
+                          onPressed: () async {
+                            final picked = await showDatePicker(
+                              context: context,
+                              initialDate: vouchersToDate ?? DateTime.now(),
+                              firstDate: DateTime(2020),
+                              lastDate: DateTime(2100),
+                            );
+                            if (picked != null && mounted) {
+                              setState(() => vouchersToDate = picked);
+                            }
+                          },
+                        ),
+                        TextButton.icon(
+                          onPressed: () {
+                            setState(() {
+                              vouchersFromDate = null;
+                              vouchersToDate = null;
+                            });
+                          },
+                          icon: const Icon(Icons.clear_all),
+                          label: const Text('إلغاء الفلترة'),
+                        ),
+                      ],
+                    ),
+                    const SizedBox(height: 12),
+                    SingleChildScrollView(
+                      scrollDirection: Axis.horizontal,
+                      child: Row(
+                        children: [
+                          amountBox('قبض USD', receiptUsd, Colors.green),
+                          const SizedBox(width: 8),
+                          amountBox('صرف USD', paymentUsd, Colors.deepOrange),
+                          const SizedBox(width: 8),
+                          amountBox(
+                            'الصافي USD',
+                            receiptUsd - paymentUsd,
+                            Colors.blue,
+                          ),
+                          const SizedBox(width: 8),
+                          amountBox('قبض SYP', receiptSyp, Colors.green),
+                          const SizedBox(width: 8),
+                          amountBox('صرف SYP', paymentSyp, Colors.deepOrange),
+                          const SizedBox(width: 8),
+                          amountBox(
+                            'الصافي SYP',
+                            receiptSyp - paymentSyp,
+                            Colors.blue,
+                          ),
+                        ],
+                      ),
+                    ),
+                    const SizedBox(height: 12),
+                    Expanded(
+                      child: LayoutBuilder(
+                        builder: (context, constraints) {
+                          return Scrollbar(
+                            thumbVisibility: true,
+                            child: SingleChildScrollView(
+                              scrollDirection: Axis.horizontal,
+                              child: ConstrainedBox(
+                                constraints: BoxConstraints(
+                                  minWidth: constraints.maxWidth,
                                 ),
-                                TextButton.icon(
-                                  onPressed: () async {
-                                    Navigator.pop(detailsContext);
-                                    await deleteAccountingVoucher(item);
-                                  },
-                                  icon: const Icon(Icons.delete_outline),
-                                  label: const Text('حذف'),
-                                ),
-                                FilledButton.icon(
-                                  onPressed: () async {
-                                    await printAccountingVoucher(
-                                      item,
-                                      partyName,
+                                child: DataTable(
+                                  showCheckboxColumn: false,
+                                  headingRowHeight: 40,
+                                  dataRowMinHeight: 40,
+                                  dataRowMaxHeight: 52,
+                                  horizontalMargin: 10,
+                                  columnSpacing: 18,
+                                  columns: const [
+                                    DataColumn(label: Text('التاريخ')),
+                                    DataColumn(label: Text('رقم السند')),
+                                    DataColumn(label: Text('النوع')),
+                                    DataColumn(label: Text('الجهة')),
+                                    DataColumn(label: Text('العملة')),
+                                    DataColumn(
+                                      numeric: true,
+                                      label: Text('المبلغ'),
+                                    ),
+                                    DataColumn(label: Text('طريقة الدفع')),
+                                    DataColumn(label: Text('البيان')),
+                                    DataColumn(label: Text('الإجراء')),
+                                  ],
+                                  rows: filteredItems.map((item) {
+                                    final receipt =
+                                        item['voucher_type'] == 'receipt';
+                                    final amount =
+                                        item['amount']?.toString() ?? '0';
+                                    final currency =
+                                        item['currency']?.toString() ?? '';
+                                    final number =
+                                        item['voucher_number']?.toString() ??
+                                        '-';
+
+                                    String partyName =
+                                        item['party_name']?.toString() ?? '';
+
+                                    final customerId = item['customer_id']
+                                        ?.toString();
+                                    final supplierId = item['supplier_id']
+                                        ?.toString();
+
+                                    if (customerId != null) {
+                                      for (final customer
+                                          in accountingCustomers) {
+                                        if (customer['id']?.toString() ==
+                                            customerId) {
+                                          partyName =
+                                              customer['name']?.toString() ??
+                                              '';
+                                          break;
+                                        }
+                                      }
+                                    }
+
+                                    if (supplierId != null) {
+                                      for (final supplier
+                                          in accountingSuppliers) {
+                                        if (supplier['id']?.toString() ==
+                                            supplierId) {
+                                          partyName =
+                                              supplier['name']?.toString() ??
+                                              '';
+                                          break;
+                                        }
+                                      }
+                                    }
+
+                                    if (partyName.isEmpty) {
+                                      partyName = ar
+                                          ? 'جهة غير محددة'
+                                          : 'Unknown party';
+                                    }
+
+                                    final rawDate =
+                                        item['transaction_date']?.toString() ??
+                                        '';
+                                    final parsedDate = DateTime.tryParse(
+                                      rawDate,
+                                    )?.toLocal();
+                                    final dateText = parsedDate == null
+                                        ? rawDate
+                                        : '${parsedDate.day.toString().padLeft(2, '0')}/'
+                                              '${parsedDate.month.toString().padLeft(2, '0')}/'
+                                              '${parsedDate.year}';
+
+                                    void openVoucherDetails() {
+                                      showDialog(
+                                        context: context,
+                                        builder: (detailsContext) => AlertDialog(
+                                          shape: RoundedRectangleBorder(
+                                            borderRadius: BorderRadius.circular(
+                                              22,
+                                            ),
+                                          ),
+                                          title: Row(
+                                            children: [
+                                              Icon(
+                                                receipt
+                                                    ? Icons.south_west_rounded
+                                                    : Icons.north_east_rounded,
+                                                color: receipt
+                                                    ? Colors.green.shade700
+                                                    : Colors
+                                                          .deepOrange
+                                                          .shade700,
+                                                size: 30,
+                                              ),
+                                              const SizedBox(width: 12),
+                                              Expanded(
+                                                child: Text(
+                                                  receipt
+                                                      ? (ar
+                                                            ? 'تفاصيل سند قبض'
+                                                            : 'Receipt Details')
+                                                      : (ar
+                                                            ? 'تفاصيل سند صرف'
+                                                            : 'Payment Details'),
+                                                  style: const TextStyle(
+                                                    fontSize: 20,
+                                                    fontWeight: FontWeight.bold,
+                                                  ),
+                                                ),
+                                              ),
+                                            ],
+                                          ),
+                                          content: SizedBox(
+                                            width: 420,
+                                            child: SingleChildScrollView(
+                                              child: Column(
+                                                mainAxisSize: MainAxisSize.min,
+                                                crossAxisAlignment:
+                                                    CrossAxisAlignment.stretch,
+                                                children: [
+                                                  Container(
+                                                    padding:
+                                                        const EdgeInsets.all(
+                                                          22,
+                                                        ),
+                                                    decoration: BoxDecoration(
+                                                      color: receipt
+                                                          ? Colors.green
+                                                                .withValues(
+                                                                  alpha: 0.10,
+                                                                )
+                                                          : Colors.deepOrange
+                                                                .withValues(
+                                                                  alpha: 0.10,
+                                                                ),
+                                                      borderRadius:
+                                                          BorderRadius.circular(
+                                                            18,
+                                                          ),
+                                                    ),
+                                                    child: Column(
+                                                      children: [
+                                                        Text(
+                                                          ar ? 'قيمة السند' : 'Voucher Amount',
+                                                          style:
+                                                              const TextStyle(
+                                                                fontSize: 14,
+                                                              ),
+                                                        ),
+                                                        const SizedBox(
+                                                          height: 8,
+                                                        ),
+                                                        Text(
+                                                          '$amount $currency',
+                                                          textAlign:
+                                                              TextAlign.center,
+                                                          style: TextStyle(
+                                                            fontSize: 30,
+                                                            fontWeight:
+                                                                FontWeight.bold,
+                                                            color: receipt
+                                                                ? Colors
+                                                                      .green
+                                                                      .shade700
+                                                                : Colors
+                                                                      .deepOrange
+                                                                      .shade700,
+                                                          ),
+                                                        ),
+                                                      ],
+                                                    ),
+                                                  ),
+                                                  const SizedBox(height: 20),
+                                                  _voucherDetailRow(
+                                                    Icons
+                                                        .confirmation_number_outlined,
+                                                    ar
+                                                        ? 'رقم السند'
+                                                        : 'Voucher Number',
+                                                    number,
+                                                  ),
+                                                  _voucherDetailRow(
+                                                    Icons.person_outline,
+                                                    ar ? 'الجهة' : 'Party',
+                                                    partyName,
+                                                  ),
+                                                  _voucherDetailRow(
+                                                    Icons.payments_outlined,
+                                                    ar
+                                                        ? 'طريقة الدفع'
+                                                        : 'Payment Method',
+                                                    item['payment_method'] ==
+                                                            'transfer'
+                                                        ? (ar
+                                                              ? 'تحويل'
+                                                              : 'Transfer')
+                                                        : (ar
+                                                              ? 'نقدي'
+                                                              : 'Cash'),
+                                                  ),
+                                                  _voucherDetailRow(
+                                                    Icons
+                                                        .calendar_today_outlined,
+                                                    ar ? 'التاريخ' : 'Date',
+                                                    item['transaction_date']
+                                                            ?.toString() ??
+                                                        '',
+                                                  ),
+                                                  _voucherDetailRow(
+                                                    Icons.notes_outlined,
+                                                    ar ? 'البيان' : 'Notes',
+                                                    item['notes']
+                                                                ?.toString()
+                                                                .isNotEmpty ==
+                                                            true
+                                                        ? item['notes']
+                                                              .toString()
+                                                        : '-',
+                                                  ),
+                                                ],
+                                              ),
+                                            ),
+                                          ),
+                                          actions: [
+                                            TextButton.icon(
+                                              onPressed: () async {
+                                                Navigator.pop(detailsContext);
+                                                await editAccountingVoucher(
+                                                  item,
+                                                );
+                                              },
+                                              icon: const Icon(
+                                                Icons.edit_outlined,
+                                              ),
+                                              label: Text(
+                                                ar ? 'تعديل' : 'Edit',
+                                              ),
+                                            ),
+                                            TextButton.icon(
+                                              onPressed: () async {
+                                                Navigator.pop(detailsContext);
+                                                await deleteAccountingVoucher(
+                                                  item,
+                                                );
+                                              },
+                                              icon: const Icon(
+                                                Icons.delete_outline,
+                                              ),
+                                              label: Text(
+                                                ar ? 'حذف' : 'Delete',
+                                              ),
+                                              style: TextButton.styleFrom(
+                                                foregroundColor:
+                                                    Colors.red.shade700,
+                                              ),
+                                            ),
+                                            FilledButton.icon(
+                                              onPressed: () async {
+                                                await printAccountingVoucher(
+                                                  item,
+                                                  partyName,
+                                                );
+                                              },
+                                              icon: const Icon(
+                                                Icons.print_outlined,
+                                              ),
+                                              label: Text(
+                                                ar
+                                                    ? 'طباعة السند'
+                                                    : 'Print Voucher',
+                                              ),
+                                            ),
+                                            TextButton(
+                                              onPressed: () =>
+                                                  Navigator.pop(detailsContext),
+                                              child: Text(
+                                                ar ? 'إغلاق' : 'Close',
+                                              ),
+                                            ),
+                                          ],
+                                        ),
+                                      );
+                                    }
+
+                                    return DataRow(
+                                      onSelectChanged: (_) =>
+                                          openVoucherDetails(),
+                                      cells: [
+                                        DataCell(Text(dateText)),
+                                        DataCell(Text(number)),
+                                        DataCell(
+                                          Text(
+                                            receipt ? 'قبض' : 'صرف',
+                                            style: TextStyle(
+                                              color: receipt
+                                                  ? Colors.green
+                                                  : Colors.deepOrange,
+                                              fontWeight: FontWeight.bold,
+                                            ),
+                                          ),
+                                        ),
+                                        DataCell(
+                                          ConstrainedBox(
+                                            constraints: const BoxConstraints(
+                                              maxWidth: 170,
+                                            ),
+                                            child: Text(
+                                              partyName,
+                                              overflow: TextOverflow.ellipsis,
+                                            ),
+                                          ),
+                                        ),
+                                        DataCell(Text(currency)),
+                                        DataCell(Text(amount)),
+                                        DataCell(
+                                          Text(
+                                            item['payment_method'] == 'transfer'
+                                                ? 'تحويل'
+                                                : 'نقدي',
+                                          ),
+                                        ),
+                                        DataCell(
+                                          ConstrainedBox(
+                                            constraints: const BoxConstraints(
+                                              maxWidth: 200,
+                                            ),
+                                            child: Text(
+                                              item['notes']?.toString() ?? '',
+                                              overflow: TextOverflow.ellipsis,
+                                            ),
+                                          ),
+                                        ),
+                                        const DataCell(
+                                          Icon(Icons.visibility_outlined),
+                                        ),
+                                      ],
                                     );
-                                  },
-                                  icon: const Icon(Icons.print),
-                                  label: Text(
-                                    ar ? 'طباعة السند' : 'Print Voucher',
-                                  ),
+                                  }).toList(),
                                 ),
-                                TextButton(
-                                  onPressed: () =>
-                                      Navigator.pop(detailsContext),
-                                  child: Text(ar ? 'إغلاق' : 'Close'),
-                                ),
-                              ],
+                              ),
                             ),
                           );
                         },
-                        contentPadding: const EdgeInsets.symmetric(
-                          horizontal: 16,
-                          vertical: 12,
-                        ),
-                        leading: Container(
-                          width: 64,
-                          height: 64,
-                          decoration: BoxDecoration(
-                            color: receipt
-                                ? Colors.green.withValues(alpha: 0.12)
-                                : Colors.red.withValues(alpha: 0.12),
-                            borderRadius: BorderRadius.circular(18),
-                            border: Border.all(
-                              color: receipt
-                                  ? Colors.green.withValues(alpha: 0.25)
-                                  : Colors.red.withValues(alpha: 0.25),
-                            ),
-                          ),
-                          child: Icon(
-                            receipt ? Icons.south_rounded : Icons.north_rounded,
-                            size: 36,
-                            color: receipt
-                                ? Colors.green.shade700
-                                : Colors.red.shade700,
-                          ),
-                        ),
-                        title: Text(
-                          '${receipt ? (ar ? 'سند قبض' : 'Receipt') : (ar ? 'سند صرف' : 'Payment')} - $number',
-                        ),
-                        subtitle: Text(
-                          '$partyName\n'
-                          '${item['transaction_date'] ?? ''}',
-                          maxLines: 3,
-                        ),
-                        isThreeLine: true,
-                        trailing: Text(
-                          '$amount $currency',
-                          style: const TextStyle(fontWeight: FontWeight.bold),
-                        ),
                       ),
-                    );
-                  },
+                    ),
+                  ],
                 );
               },
             ),
@@ -12537,7 +14555,3578 @@ class _DashboardPageState extends State<DashboardPage> {
     );
   }
 
+  String accountingStatementPartyType = 'customer';
+  String? accountingStatementPartyId;
+  String accountingStatementSearch = '';
+  bool accountingStatementShowResults = false;
+  DateTime? accountingStatementFromDate = DateTime(DateTime.now().year, 1, 1);
+  DateTime? accountingStatementToDate;
+  Future<List<Map<String, dynamic>>>? accountingStatementFuture;
+
+  Future<List<Map<String, dynamic>>> loadAccountingStatementEntries(
+    String partyType,
+    String partyId,
+  ) async {
+    final db = Supabase.instance.client;
+    final isCustomer = partyType == 'customer';
+
+    final invoicesData = await db
+        .from(isCustomer ? 'accounting_sales' : 'accounting_purchases')
+        .select()
+        .eq(isCustomer ? 'customer_id' : 'supplier_id', partyId)
+        .eq('created_by', widget.currentUser.id);
+
+    final transactionsData = await db
+        .from('accounting_transactions')
+        .select()
+        .eq(isCustomer ? 'customer_id' : 'supplier_id', partyId)
+        .eq('created_by', widget.currentUser.id);
+
+    final entries = <Map<String, dynamic>>[];
+
+    for (final invoice in invoicesData) {
+      if (invoice['status']?.toString().toLowerCase() == 'cancelled') {
+        continue;
+      }
+
+      entries.add({
+        ...Map<String, dynamic>.from(invoice),
+        '_kind': 'invoice',
+        '_date': invoice['created_at']?.toString() ?? '',
+      });
+    }
+
+    for (final transaction in transactionsData) {
+      entries.add({
+        ...Map<String, dynamic>.from(transaction),
+        '_kind': 'transaction',
+        '_date':
+            transaction['transaction_date']?.toString() ??
+            transaction['created_at']?.toString() ??
+            '',
+      });
+    }
+
+    entries.sort((a, b) {
+      final aDate =
+          DateTime.tryParse(a['_date']?.toString() ?? '') ??
+          DateTime.fromMillisecondsSinceEpoch(0);
+      final bDate =
+          DateTime.tryParse(b['_date']?.toString() ?? '') ??
+          DateTime.fromMillisecondsSinceEpoch(0);
+      final compare = aDate.compareTo(bDate);
+      if (compare != 0) return compare;
+      return (a['id']?.toString() ?? '').compareTo(b['id']?.toString() ?? '');
+    });
+
+    return entries;
+  }
+
+  Future<void> printAccountingStatementPdf({
+    required String partyName,
+    required bool isCustomer,
+    required List<Map<String, dynamic>> rows,
+    required double balanceUsd,
+    required double balanceSyp,
+  }) async {
+    try {
+      final regular = await PdfGoogleFonts.notoNaskhArabicRegular();
+      final bold = await PdfGoogleFonts.notoNaskhArabicBold();
+      final document = pw.Document();
+
+      String dateText(DateTime? date) {
+        if (date == null) return 'اليوم';
+        return '${date.year}-${date.month.toString().padLeft(2, '0')}-${date.day.toString().padLeft(2, '0')}';
+      }
+
+      String money(Object? value) {
+        final amount = value is num ? value.toDouble() : 0.0;
+        return amount.toStringAsFixed(2);
+      }
+
+      pw.Widget pdfCell(
+        String value, {
+        bool header = false,
+        pw.Alignment alignment = pw.Alignment.centerRight,
+      }) {
+        return pw.Container(
+          alignment: alignment,
+          padding: const pw.EdgeInsets.symmetric(horizontal: 3, vertical: 6),
+          child: pw.Text(
+            value,
+            textDirection: pw.TextDirection.rtl,
+            style: pw.TextStyle(
+              font: header ? bold : regular,
+              fontSize: header ? 10 : 9,
+              color: header ? PdfColors.white : PdfColors.black,
+            ),
+          ),
+        );
+      }
+
+      final tableRows = <pw.TableRow>[
+        pw.TableRow(
+          decoration: const pw.BoxDecoration(color: PdfColors.indigo900),
+          children: [
+            pdfCell('التاريخ', header: true),
+            pdfCell('المستند', header: true),
+            pdfCell('البيان', header: true),
+            pdfCell('مدين', header: true),
+            pdfCell('دائن', header: true),
+            pdfCell('الرصيد', header: true),
+          ],
+        ),
+      ];
+
+      for (final row in rows) {
+        final invoice = row['_kind'] == 'invoice';
+        final documentName = row['_kind'] == 'opening'
+            ? 'رصيد مرحل'
+            : row['_kind'] == 'invoice_payment'
+            ? 'دفعة ضمن الفاتورة #${row['invoice_number'] ?? ''}'
+            : invoice
+            ? '${isCustomer ? 'مبيعات' : 'مشتريات'} #${row['invoice_number'] ?? ''}'
+            : (row['transaction_type'] == 'customer_receipt' ||
+                  row['transaction_type'] == 'supplier_receipt')
+            ? 'سند قبض'
+            : 'سند صرف';
+
+        final date = row['_date']?.toString().split('T').first ?? '';
+        final notes = row['notes']?.toString() ?? documentName;
+
+        String bothCurrencies(String usdKey, String sypKey) {
+          return 'USD ${money(row[usdKey])}\nSYP ${money(row[sypKey])}';
+        }
+
+        tableRows.add(
+          pw.TableRow(
+            decoration: pw.BoxDecoration(
+              color: tableRows.length.isEven
+                  ? PdfColors.grey100
+                  : PdfColors.white,
+            ),
+            children: [
+              pdfCell(date),
+              pdfCell(documentName),
+              pdfCell(notes),
+              pdfCell(bothCurrencies('_debitUsd', '_debitSyp')),
+              pdfCell(bothCurrencies('_creditUsd', '_creditSyp')),
+              pdfCell(bothCurrencies('_balanceUsd', '_balanceSyp')),
+            ],
+          ),
+        );
+      }
+
+      document.addPage(
+        pw.MultiPage(
+          pageFormat: PdfPageFormat.a4.landscape,
+          margin: const pw.EdgeInsets.all(24),
+          textDirection: pw.TextDirection.rtl,
+          header: (context) => pw.Column(
+            crossAxisAlignment: pw.CrossAxisAlignment.center,
+            children: [
+              pw.Text(
+                'منصة قصر الحجاج',
+                style: pw.TextStyle(font: bold, fontSize: 20),
+              ),
+              pw.SizedBox(height: 5),
+              pw.Text(
+                'كشف حساب السيد: $partyName',
+                style: pw.TextStyle(font: bold, fontSize: 16),
+              ),
+              pw.SizedBox(height: 5),
+              pw.Text(
+                'الفترة من ${dateText(accountingStatementFromDate)} إلى ${dateText(accountingStatementToDate)}',
+                style: pw.TextStyle(font: regular, fontSize: 11),
+              ),
+              pw.SizedBox(height: 12),
+            ],
+          ),
+          footer: (context) => pw.Column(
+            children: [
+              pw.Divider(),
+              pw.Row(
+                mainAxisAlignment: pw.MainAxisAlignment.spaceBetween,
+                children: [
+                  pw.Text(
+                    'صفحة ${context.pageNumber} من ${context.pagesCount}',
+                    style: pw.TextStyle(font: regular, fontSize: 9),
+                  ),
+                  pw.Text(
+                    'NetManager',
+                    style: pw.TextStyle(font: bold, fontSize: 9),
+                  ),
+                ],
+              ),
+            ],
+          ),
+          build: (context) => [
+            pw.Table(
+              border: pw.TableBorder.all(color: PdfColors.grey400, width: 0.5),
+              columnWidths: {
+                0: const pw.FlexColumnWidth(1.1),
+                1: const pw.FlexColumnWidth(1.4),
+                2: const pw.FlexColumnWidth(2.3),
+                3: const pw.FlexColumnWidth(1.6),
+                4: const pw.FlexColumnWidth(1.6),
+                5: const pw.FlexColumnWidth(1.6),
+              },
+              children: tableRows,
+            ),
+            pw.SizedBox(height: 15),
+            pw.Container(
+              padding: const pw.EdgeInsets.all(12),
+              decoration: pw.BoxDecoration(
+                border: pw.Border.all(color: PdfColors.indigo700, width: 1.2),
+              ),
+              child: pw.Column(
+                crossAxisAlignment: pw.CrossAxisAlignment.start,
+                children: [
+                  pw.Text(
+                    'الرصيد النهائي',
+                    style: pw.TextStyle(
+                      font: bold,
+                      fontSize: 15,
+                      color: PdfColors.indigo900,
+                    ),
+                  ),
+                  pw.SizedBox(height: 5),
+                  pw.Text(
+                    'USD: ${money(balanceUsd)}',
+                    style: pw.TextStyle(font: regular, fontSize: 12),
+                  ),
+                  pw.Text(
+                    'SYP: ${money(balanceSyp)}',
+                    style: pw.TextStyle(font: regular, fontSize: 12),
+                  ),
+                ],
+              ),
+            ),
+          ],
+        ),
+      );
+
+      await Printing.layoutPdf(
+        onLayout: (format) async => document.save(),
+        name: 'Account_Statement',
+      );
+    } catch (e) {
+      if (!mounted) return;
+      ScaffoldMessenger.of(context)
+          .showSnackBar(SnackBar(content: Text('تعذر طباعة كشف الحساب: $e')));
+    }
+  }
+
+  String? statementExpandedInvoice;
+  Future<List<Map<String, dynamic>>>? statementExpandedItems;
+
+  Future<List<Map<String, dynamic>>> fetchStatementItems(
+    String invoiceId,
+    bool customer,
+  ) async {
+    final db = Supabase.instance.client;
+    final data = await db
+        .from(customer ? 'accounting_sale_items' : 'accounting_purchase_items')
+        .select()
+        .eq(customer ? 'sale_id' : 'purchase_id', invoiceId);
+
+    final products = await db
+        .from('accounting_products')
+        .select('id,name')
+        .eq('created_by', widget.currentUser.id);
+
+    final names = {
+      for (final p in products) p['id'].toString(): p['name']?.toString() ?? '',
+    };
+
+    return [
+      for (final item in data)
+        {
+          ...Map<String, dynamic>.from(item),
+          '_name': names[item['product_id']?.toString()] ?? 'مادة غير معروفة',
+        },
+    ];
+  }
+
+  Future<void> showStatementInvoiceReadOnly(
+    Map<String, dynamic> invoice, {
+    required bool isCustomer,
+  }) async {
+    final invoiceId = invoice['id']?.toString() ?? '';
+    if (invoiceId.isEmpty) return;
+
+    try {
+      final db = Supabase.instance.client;
+
+      final fresh = await db
+          .from(isCustomer ? 'accounting_sales' : 'accounting_purchases')
+          .select()
+          .eq('id', invoiceId)
+          .eq('created_by', widget.currentUser.id)
+          .single();
+
+      final items = await fetchStatementItems(invoiceId, isCustomer);
+
+      if (!mounted) return;
+
+      String money(Object? value) {
+        final number = value is num
+            ? value.toDouble()
+            : double.tryParse(value?.toString() ?? '') ?? 0.0;
+        return number.toStringAsFixed(2);
+      }
+
+      Widget amountRow(String title, String field) {
+        return Padding(
+          padding: const EdgeInsets.symmetric(vertical: 4),
+          child: Row(
+            children: [
+              Expanded(child: Text(title)),
+              Text(money(fresh[field])),
+            ],
+          ),
+        );
+      }
+
+      await showDialog<void>(
+        context: context,
+        builder: (dialogContext) => AlertDialog(
+          title: Text(
+            '${isCustomer ? 'فاتورة مبيعات' : 'فاتورة مشتريات'} '
+            '#${fresh['invoice_number'] ?? ''}',
+          ),
+          content: SizedBox(
+            width: 600,
+            child: SingleChildScrollView(
+              child: Column(
+                mainAxisSize: MainAxisSize.min,
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  const Text(
+                    'عرض فقط - لا يمكن تعديل الفاتورة',
+                    style: TextStyle(fontWeight: FontWeight.bold),
+                  ),
+                  const SizedBox(height: 10),
+                  Text(
+                    'التاريخ: '
+                    '${fresh['created_at']?.toString().split('T').first ?? ''}',
+                  ),
+                  const Divider(),
+                  const Text(
+                    'مواد الفاتورة',
+                    style: TextStyle(fontWeight: FontWeight.bold),
+                  ),
+                  if (items.isEmpty) const Text('لا توجد مواد مسجلة'),
+                  for (final item in items)
+                    Card(
+                      margin: const EdgeInsets.symmetric(vertical: 4),
+                      child: Padding(
+                        padding: const EdgeInsets.all(10),
+                        child: Column(
+                          crossAxisAlignment: CrossAxisAlignment.start,
+                          children: [
+                            Text(
+                              item['_name']?.toString() ?? '',
+                              style: const TextStyle(
+                                fontWeight: FontWeight.bold,
+                              ),
+                            ),
+                            const SizedBox(height: 4),
+                            Text(
+                              'الكمية: ${item['quantity'] ?? 0} | '
+                              'السعر: ${money(item[isCustomer ? 'unit_price' : 'unit_cost'])}',
+                            ),
+                          ],
+                        ),
+                      ),
+                    ),
+                  const Divider(),
+                  amountRow('الإجمالي بالدولار', 'total_usd'),
+                  amountRow('الإجمالي بالسوري', 'total_syp'),
+                  amountRow('المدفوع بالدولار', 'paid_usd'),
+                  amountRow('المدفوع بالسوري', 'paid_syp'),
+                ],
+              ),
+            ),
+          ),
+          actions: [
+            TextButton(
+              onPressed: () => Navigator.pop(dialogContext),
+              child: const Text('إغلاق'),
+            ),
+            FilledButton.icon(
+              onPressed: () {
+                Navigator.pop(dialogContext);
+                if (isCustomer) {
+                  openAccountingSalesInvoicePage(existingSale: fresh);
+                } else {
+                  openAccountingPurchaseInvoicePage(existingPurchase: fresh);
+                }
+              },
+              icon: const Icon(Icons.edit_outlined),
+              label: const Text('تعديل الفاتورة'),
+            ),
+          ],
+        ),
+      );
+    } catch (e) {
+      if (!mounted) return;
+      ScaffoldMessenger.of(context)
+          .showSnackBar(SnackBar(content: Text('تعذر عرض الفاتورة: $e')));
+    }
+  }
+
+  Widget buildAccountingStatementPage() {
+    final isArabic = widget.currentUser.language == 'ar';
+    final isCustomer = accountingStatementPartyType == 'customer';
+
+    final parties = isCustomer ? accountingCustomers : accountingSuppliers;
+
+    final search = accountingStatementSearch.trim().toLowerCase();
+
+    final allParties = <Map<String, dynamic>>[
+      ...accountingCustomers.map((item) => {...item, '_partyType': 'customer'}),
+      ...accountingSuppliers.map((item) => {...item, '_partyType': 'supplier'}),
+    ];
+
+    final filtered = allParties.where((item) {
+      final name = item['name']?.toString().toLowerCase() ?? '';
+      final phone = item['phone']?.toString().toLowerCase() ?? '';
+      return accountingStatementShowResults &&
+          search.isNotEmpty &&
+          (name.contains(search) || phone.contains(search));
+    }).toList();
+
+    final selectedParty = parties
+        .where((party) => party['id']?.toString() == accountingStatementPartyId)
+        .toList();
+
+    final party = selectedParty.isEmpty ? null : selectedParty.first;
+    final opening = (party?['opening_balance'] as num?)?.toDouble() ?? 0;
+    final openingCurrency =
+        party?['currency']?.toString().toUpperCase() ?? 'USD';
+
+    return Padding(
+      padding: const EdgeInsets.all(16),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          LayoutBuilder(
+            builder: (context, constraints) {
+              final mobile = constraints.maxWidth < 650;
+
+              final title = Text(
+                party == null
+                    ? 'كشف الحساب'
+                    : 'كشف حساب السيد: ${party['name'] ?? ''}',
+                maxLines: 1,
+                overflow: TextOverflow.ellipsis,
+                style: TextStyle(
+                  fontSize: mobile ? 14 : 18,
+                  fontWeight: FontWeight.bold,
+                ),
+              );
+
+              if (mobile) {
+                return Column(
+                  mainAxisSize: MainAxisSize.min,
+                  children: [
+                    Row(
+                      children: [
+                        IconButton(
+                          tooltip: 'رجوع',
+                          visualDensity: VisualDensity.compact,
+                          onPressed: () => setState(() => selectedIndex = 14),
+                          icon: const Icon(Icons.arrow_back, size: 20),
+                        ),
+                        Expanded(child: title),
+                        if (party != null)
+                          TextButton.icon(
+                            style: TextButton.styleFrom(
+                              visualDensity: VisualDensity.compact,
+                              padding: const EdgeInsets.symmetric(
+                                horizontal: 4,
+                              ),
+                            ),
+                            onPressed: () {
+                              setState(() {
+                                accountingStatementPartyId = null;
+                                accountingStatementSearch = '';
+                                accountingStatementShowResults = false;
+                                accountingStatementFuture = null;
+                                accountingStatementFromDate = DateTime(
+                                  DateTime.now().year,
+                                  1,
+                                  1,
+                                );
+                                accountingStatementToDate = null;
+                              });
+                            },
+                            icon: const Icon(Icons.search, size: 15),
+                            label: const Text(
+                              'بحث جديد',
+                              style: TextStyle(fontSize: 11),
+                            ),
+                          ),
+                      ],
+                    ),
+                    if (party != null)
+                      Row(
+                        mainAxisAlignment: MainAxisAlignment.center,
+                        children: [
+                          Flexible(
+                            child: FittedBox(
+                              fit: BoxFit.scaleDown,
+                              child: OutlinedButton.icon(
+                                style: OutlinedButton.styleFrom(
+                                  visualDensity: VisualDensity.compact,
+                                  padding: const EdgeInsets.symmetric(
+                                    horizontal: 5,
+                                    vertical: 2,
+                                  ),
+                                  minimumSize: const Size(0, 34),
+                                  tapTargetSize:
+                                      MaterialTapTargetSize.shrinkWrap,
+                                ),
+                                icon: const Icon(Icons.event, size: 15),
+                                label: Text(
+                                  accountingStatementFromDate == null
+                                      ? 'من تاريخ'
+                                      : 'من: ${accountingStatementFromDate!.year}-${accountingStatementFromDate!.month.toString().padLeft(2, '0')}-${accountingStatementFromDate!.day.toString().padLeft(2, '0')}',
+                                ),
+                                onPressed: () async {
+                                  final date = await showDatePicker(
+                                    context: context,
+                                    initialDate:
+                                        accountingStatementFromDate ??
+                                        DateTime.now(),
+                                    firstDate: DateTime(2000),
+                                    lastDate:
+                                        accountingStatementToDate ??
+                                        DateTime(2100),
+                                  );
+                                  if (date == null || !mounted) return;
+                                  setState(() {
+                                    accountingStatementFromDate = date;
+                                  });
+                                },
+                              ),
+                            ),
+                          ),
+                          const SizedBox(width: 4),
+                          Flexible(
+                            child: FittedBox(
+                              fit: BoxFit.scaleDown,
+                              child: OutlinedButton.icon(
+                                style: OutlinedButton.styleFrom(
+                                  visualDensity: VisualDensity.compact,
+                                  padding: const EdgeInsets.symmetric(
+                                    horizontal: 5,
+                                    vertical: 2,
+                                  ),
+                                  minimumSize: const Size(0, 34),
+                                  tapTargetSize:
+                                      MaterialTapTargetSize.shrinkWrap,
+                                ),
+                                icon: const Icon(Icons.event, size: 15),
+                                label: Text(
+                                  accountingStatementToDate == null
+                                      ? 'إلى: اليوم'
+                                      : 'إلى: ${accountingStatementToDate!.year}-${accountingStatementToDate!.month.toString().padLeft(2, '0')}-${accountingStatementToDate!.day.toString().padLeft(2, '0')}',
+                                ),
+                                onPressed: () async {
+                                  final date = await showDatePicker(
+                                    context: context,
+                                    initialDate:
+                                        accountingStatementToDate ??
+                                        DateTime.now(),
+                                    firstDate:
+                                        accountingStatementFromDate ??
+                                        DateTime(2000),
+                                    lastDate: DateTime(2100),
+                                  );
+                                  if (date == null || !mounted) return;
+                                  setState(() {
+                                    accountingStatementToDate = date;
+                                  });
+                                },
+                              ),
+                            ),
+                          ),
+                          IconButton(
+                            tooltip: 'إعادة الفترة الافتراضية',
+                            visualDensity: VisualDensity.compact,
+                            icon: const Icon(Icons.restart_alt, size: 19),
+                            onPressed: () {
+                              setState(() {
+                                accountingStatementFromDate = DateTime(
+                                  DateTime.now().year,
+                                  1,
+                                  1,
+                                );
+                                accountingStatementToDate = null;
+                              });
+                            },
+                          ),
+                        ],
+                      ),
+                  ],
+                );
+              }
+
+              return Row(
+                children: [
+                  IconButton(
+                    tooltip: 'رجوع',
+                    onPressed: () => setState(() => selectedIndex = 14),
+                    icon: const Icon(Icons.arrow_back),
+                  ),
+                  Expanded(child: title),
+                  if (party != null)
+                    Flexible(
+                      flex: 4,
+                      child: SingleChildScrollView(
+                        scrollDirection: Axis.horizontal,
+                        child: Row(
+                          mainAxisSize: MainAxisSize.min,
+                          children: [
+                            OutlinedButton.icon(
+                              icon: const Icon(Icons.event),
+                              label: Text(
+                                accountingStatementFromDate == null
+                                    ? 'من تاريخ'
+                                    : 'من: ${accountingStatementFromDate!.year}-${accountingStatementFromDate!.month.toString().padLeft(2, '0')}-${accountingStatementFromDate!.day.toString().padLeft(2, '0')}',
+                              ),
+                              onPressed: () async {
+                                final date = await showDatePicker(
+                                  context: context,
+                                  initialDate:
+                                      accountingStatementFromDate ??
+                                      DateTime.now(),
+                                  firstDate: DateTime(2000),
+                                  lastDate:
+                                      accountingStatementToDate ??
+                                      DateTime(2100),
+                                );
+                                if (date == null || !mounted) return;
+                                setState(() {
+                                  accountingStatementFromDate = date;
+                                });
+                              },
+                            ),
+                            OutlinedButton.icon(
+                              icon: const Icon(Icons.event),
+                              label: Text(
+                                accountingStatementToDate == null
+                                    ? 'إلى: اليوم'
+                                    : 'إلى: ${accountingStatementToDate!.year}-${accountingStatementToDate!.month.toString().padLeft(2, '0')}-${accountingStatementToDate!.day.toString().padLeft(2, '0')}',
+                              ),
+                              onPressed: () async {
+                                final date = await showDatePicker(
+                                  context: context,
+                                  initialDate:
+                                      accountingStatementToDate ??
+                                      DateTime.now(),
+                                  firstDate:
+                                      accountingStatementFromDate ??
+                                      DateTime(2000),
+                                  lastDate: DateTime(2100),
+                                );
+                                if (date == null || !mounted) return;
+                                setState(() {
+                                  accountingStatementToDate = date;
+                                });
+                              },
+                            ),
+                            IconButton(
+                              tooltip: 'إعادة الفترة الافتراضية',
+                              icon: const Icon(Icons.restart_alt),
+                              onPressed: () {
+                                setState(() {
+                                  accountingStatementFromDate = DateTime(
+                                    DateTime.now().year,
+                                    1,
+                                    1,
+                                  );
+                                  accountingStatementToDate = null;
+                                });
+                              },
+                            ),
+                            OutlinedButton.icon(
+                              icon: const Icon(Icons.search),
+                              label: const Text('بحث جديد'),
+                              onPressed: () {
+                                setState(() {
+                                  accountingStatementPartyId = null;
+                                  accountingStatementSearch = '';
+                                  accountingStatementShowResults = false;
+                                  accountingStatementFuture = null;
+                                  accountingStatementFromDate = DateTime(
+                                    DateTime.now().year,
+                                    1,
+                                    1,
+                                  );
+                                  accountingStatementToDate = null;
+                                });
+                              },
+                            ),
+                          ],
+                        ),
+                      ),
+                    ),
+                ],
+              );
+            },
+          ),
+          const SizedBox(height: 4),
+          if (party == null)
+            Card(
+              child: Padding(
+                padding: const EdgeInsets.all(12),
+                child: party == null
+                    ? Column(
+                        children: [
+                          TextField(
+                            decoration: InputDecoration(
+                              prefixIcon: const Icon(Icons.search),
+                              labelText: isArabic
+                                  ? 'ابحث عن زبون أو مورد بالاسم أو الهاتف'
+                                  : 'Search customers or suppliers',
+                              border: const OutlineInputBorder(),
+                            ),
+                            onChanged: (value) {
+                              setState(() {
+                                accountingStatementSearch = value;
+                                accountingStatementShowResults = value
+                                    .trim()
+                                    .isNotEmpty;
+                              });
+                            },
+                          ),
+                          if (accountingStatementShowResults &&
+                              search.isNotEmpty)
+                            SizedBox(
+                              height: 180,
+                              child: ListView.builder(
+                                itemCount: filtered.length,
+                                itemBuilder: (context, index) {
+                                  final item = filtered[index];
+                                  final type = item['_partyType'].toString();
+                                  final id = item['id'].toString();
+
+                                  return ListTile(
+                                    dense: true,
+                                    leading: Icon(
+                                      type == 'customer'
+                                          ? Icons.person_outline
+                                          : Icons.local_shipping_outlined,
+                                    ),
+                                    title: Text(item['name']?.toString() ?? ''),
+                                    subtitle: Text(
+                                      type == 'customer' ? 'زبون' : 'مورد',
+                                    ),
+                                    onTap: () {
+                                      FocusScope.of(context).unfocus();
+                                      setState(() {
+                                        accountingStatementPartyType = type;
+                                        accountingStatementPartyId = id;
+                                        accountingStatementSearch = '';
+                                        accountingStatementShowResults = false;
+                                        accountingStatementFuture =
+                                            loadAccountingStatementEntries(
+                                              type,
+                                              id,
+                                            );
+                                      });
+                                    },
+                                  );
+                                },
+                              ),
+                            ),
+                        ],
+                      )
+                    : const SizedBox.shrink(),
+              ),
+            ),
+          const SizedBox(height: 12),
+          Expanded(
+            child: accountingStatementFuture == null
+                ? Center(
+                    child: Text(
+                      isArabic
+                          ? 'اختر زبونًا أو موردًا لعرض الحركات'
+                          : 'Select an account to show transactions',
+                    ),
+                  )
+                : FutureBuilder<List<Map<String, dynamic>>>(
+                    future: accountingStatementFuture,
+                    builder: (context, snapshot) {
+                      if (snapshot.connectionState != ConnectionState.done) {
+                        return const Center(child: CircularProgressIndicator());
+                      }
+
+                      if (snapshot.hasError) {
+                        return Center(
+                          child: Text(
+                            'خطأ في تحميل كشف الحساب: ${snapshot.error}',
+                          ),
+                        );
+                      }
+
+                      final entries = snapshot.data ?? [];
+
+                      double balanceUsd = openingCurrency == 'USD'
+                          ? opening
+                          : 0;
+                      double balanceSyp = openingCurrency == 'SYP'
+                          ? opening
+                          : 0;
+
+                      final rows = <Map<String, dynamic>>[];
+                      final fromDate = accountingStatementFromDate;
+                      final toDate = accountingStatementToDate;
+
+                      double carriedUsd = balanceUsd;
+                      double carriedSyp = balanceSyp;
+
+                      for (final entry in entries) {
+                        double debitUsd = 0;
+                        double creditUsd = 0;
+                        double debitSyp = 0;
+                        double creditSyp = 0;
+
+                        final isInvoice = entry['_kind'] == 'invoice';
+
+                        if (isInvoice) {
+                          debitUsd =
+                              (entry['total_usd'] as num?)?.toDouble() ?? 0;
+
+                          debitSyp =
+                              (entry['total_syp'] as num?)?.toDouble() ?? 0;
+                        } else {
+                          final amount =
+                              (entry['amount'] as num?)?.toDouble() ?? 0;
+                          final type =
+                              entry['transaction_type']?.toString() ?? '';
+                          final currency =
+                              entry['currency']?.toString().toUpperCase() ?? '';
+
+                          final isDebit = isCustomer
+                              ? type == 'customer_payment'
+                              : type == 'supplier_receipt';
+
+                          final isCredit = isCustomer
+                              ? type == 'customer_receipt'
+                              : type == 'supplier_payment';
+
+                          if (currency == 'USD') {
+                            if (isDebit) debitUsd = amount;
+                            if (isCredit) creditUsd = amount;
+                          } else if (currency == 'SYP') {
+                            if (isDebit) debitSyp = amount;
+                            if (isCredit) creditSyp = amount;
+                          }
+                        }
+
+                        final parsedDate = DateTime.tryParse(
+                          entry['_date']?.toString() ?? '',
+                        );
+
+                        final movementDay = parsedDate == null
+                            ? null
+                            : DateTime(
+                                parsedDate.year,
+                                parsedDate.month,
+                                parsedDate.day,
+                              );
+
+                        final beforePeriod =
+                            fromDate != null &&
+                            movementDay != null &&
+                            movementDay.isBefore(fromDate);
+
+                        final afterPeriod =
+                            toDate != null &&
+                            movementDay != null &&
+                            movementDay.isAfter(toDate);
+
+                        if (beforePeriod) {
+                          carriedUsd += debitUsd - creditUsd;
+                          carriedSyp += debitSyp - creditSyp;
+
+                          if (isInvoice) {
+                            carriedUsd -=
+                                (entry['paid_usd'] as num?)?.toDouble() ?? 0;
+                            carriedSyp -=
+                                (entry['paid_syp'] as num?)?.toDouble() ?? 0;
+                          }
+                          continue;
+                        }
+
+                        if (afterPeriod) continue;
+
+                        balanceUsd += debitUsd - creditUsd;
+                        balanceSyp += debitSyp - creditSyp;
+
+                        rows.add({
+                          ...entry,
+                          '_debitUsd': debitUsd,
+                          '_creditUsd': creditUsd,
+                          '_debitSyp': debitSyp,
+                          '_creditSyp': creditSyp,
+                          '_balanceUsd': balanceUsd,
+                          '_balanceSyp': balanceSyp,
+                        });
+
+                        if (isInvoice) {
+                          final paidUsd =
+                              (entry['paid_usd'] as num?)?.toDouble() ?? 0;
+                          final paidSyp =
+                              (entry['paid_syp'] as num?)?.toDouble() ?? 0;
+
+                          if (paidUsd != 0 || paidSyp != 0) {
+                            balanceUsd -= paidUsd;
+                            balanceSyp -= paidSyp;
+
+                            rows.add({
+                              ...entry,
+                              '_kind': 'invoice_payment',
+                              '_debitUsd': 0.0,
+                              '_creditUsd': paidUsd,
+                              '_debitSyp': 0.0,
+                              '_creditSyp': paidSyp,
+                              '_balanceUsd': balanceUsd,
+                              '_balanceSyp': balanceSyp,
+                              'notes':
+                                  'دفعة ضمن الفاتورة رقم ${entry['invoice_number'] ?? ''}',
+                            });
+                          }
+                        }
+                      }
+
+                      if (fromDate != null) {
+                        final offsetUsd =
+                            carriedUsd -
+                            (openingCurrency == 'USD' ? opening : 0);
+                        final offsetSyp =
+                            carriedSyp -
+                            (openingCurrency == 'SYP' ? opening : 0);
+
+                        balanceUsd += offsetUsd;
+                        balanceSyp += offsetSyp;
+
+                        for (final row in rows) {
+                          row['_balanceUsd'] =
+                              (row['_balanceUsd'] as num).toDouble() +
+                              offsetUsd;
+                          row['_balanceSyp'] =
+                              (row['_balanceSyp'] as num).toDouble() +
+                              offsetSyp;
+                        }
+                      }
+
+                      String amounts(double usd, double syp) =>
+                          'USD: ${usd.toStringAsFixed(2)}\n'
+                          'SYP: ${syp.toStringAsFixed(2)}';
+
+                      if (fromDate != null) {
+                        rows.insert(0, {
+                          '_kind': 'opening',
+                          '_date': '',
+                          '_debitUsd': 0.0,
+                          '_creditUsd': 0.0,
+                          '_debitSyp': 0.0,
+                          '_creditSyp': 0.0,
+                          '_balanceUsd': carriedUsd,
+                          '_balanceSyp': carriedSyp,
+                          'notes': 'الرصيد المرحل من الفترة السابقة',
+                        });
+                      }
+
+                      return Column(
+                        children: [
+                          Expanded(
+                            child: LayoutBuilder(
+                              builder: (context, constraints) {
+                                final width = constraints.maxWidth;
+                                final compact = width < 650;
+                                final veryCompact = width < 390;
+                                final fontSize = veryCompact
+                                    ? 8.0
+                                    : compact
+                                    ? 9.5
+                                    : 13.0;
+
+                                final dateFlex = compact ? 13 : 12;
+                                final documentFlex = compact ? 15 : 16;
+                                final descriptionFlex = compact ? 17 : 25;
+                                final amountFlex = compact ? 18 : 16;
+
+                                Widget cell(
+                                  String value,
+                                  int flex, {
+                                  bool bold = false,
+                                  TextAlign alignment = TextAlign.start,
+                                }) {
+                                  return Expanded(
+                                    flex: flex,
+                                    child: Padding(
+                                      padding: EdgeInsets.symmetric(
+                                        horizontal: compact ? 2 : 8,
+                                        vertical: compact ? 5 : 9,
+                                      ),
+                                      child: Text(
+                                        value,
+                                        softWrap: true,
+                                        textAlign: alignment,
+                                        style: TextStyle(
+                                          fontSize: fontSize,
+                                          height: compact ? 1.3 : 1.5,
+                                          fontWeight: bold
+                                              ? FontWeight.bold
+                                              : FontWeight.normal,
+                                        ),
+                                      ),
+                                    ),
+                                  );
+                                }
+
+                                Widget amountCell(double usd, double syp) {
+                                  return Expanded(
+                                    flex: amountFlex,
+                                    child: Padding(
+                                      padding: EdgeInsets.symmetric(
+                                        horizontal: compact ? 1 : 8,
+                                        vertical: compact ? 5 : 9,
+                                      ),
+                                      child: Column(
+                                        crossAxisAlignment:
+                                            CrossAxisAlignment.start,
+                                        mainAxisSize: MainAxisSize.min,
+                                        children: [
+                                          Text(
+                                            'USD ${usd.toStringAsFixed(2)}',
+                                            softWrap: true,
+                                            style: TextStyle(
+                                              fontSize: fontSize,
+                                              height: 1.35,
+                                            ),
+                                          ),
+                                          Text(
+                                            'SYP ${syp.toStringAsFixed(2)}',
+                                            softWrap: true,
+                                            style: TextStyle(
+                                              fontSize: fontSize,
+                                              height: 1.35,
+                                            ),
+                                          ),
+                                        ],
+                                      ),
+                                    ),
+                                  );
+                                }
+
+                                return Column(
+                                  children: [
+                                    Container(
+                                      color: Theme.of(context)
+                                          .colorScheme
+                                          .surfaceContainerHighest,
+                                      child: Row(
+                                        children: [
+                                          cell('التاريخ', dateFlex, bold: true),
+                                          cell(
+                                            'المستند',
+                                            documentFlex,
+                                            bold: true,
+                                          ),
+                                          cell(
+                                            'البيان',
+                                            descriptionFlex,
+                                            bold: true,
+                                          ),
+                                          cell('مدين', amountFlex, bold: true),
+                                          cell('دائن', amountFlex, bold: true),
+                                          cell(
+                                            'الرصيد',
+                                            amountFlex,
+                                            bold: true,
+                                          ),
+                                        ],
+                                      ),
+                                    ),
+                                    const Divider(height: 1),
+                                    Expanded(
+                                      child: ListView.separated(
+                                        itemCount: rows.length,
+                                        separatorBuilder: (_, _) =>
+                                            const Divider(height: 1),
+                                        itemBuilder: (context, index) {
+                                          final row = rows[index];
+                                          final invoice =
+                                              row['_kind'] == 'invoice';
+
+                                          final document =
+                                              row['_kind'] == 'opening'
+                                              ? 'رصيد مرحل'
+                                              : row['_kind'] ==
+                                                    'invoice_payment'
+                                              ? 'دفعة ضمن الفاتورة #${row['invoice_number'] ?? ''}'
+                                              : invoice
+                                              ? '${isCustomer ? 'مبيعات' : 'مشتريات'} #${row['invoice_number'] ?? ''}'
+                                              : (row['transaction_type'] ==
+                                                        'customer_receipt' ||
+                                                    row['transaction_type'] ==
+                                                        'supplier_receipt')
+                                              ? 'سند قبض'
+                                              : 'سند صرف';
+
+                                          final date =
+                                              row['_date']
+                                                  ?.toString()
+                                                  .split('T')
+                                                  .first ??
+                                              '';
+
+                                          return InkWell(
+                                            onDoubleTap: invoice
+                                                ? () =>
+                                                      showStatementInvoiceReadOnly(
+                                                        row,
+                                                        isCustomer: isCustomer,
+                                                      )
+                                                : null,
+                                            onTap: row['_kind'] == 'opening'
+                                                ? null
+                                                : () async {
+                                                    if (invoice) {
+                                                      return;
+                                                    } else {
+                                                      if (!context.mounted) {
+                                                        return;
+                                                      }
+                                                      await showDialog<void>(
+                                                        context: context,
+                                                        builder: (dialogContext) => AlertDialog(
+                                                          title: Text(document),
+                                                          content: Column(
+                                                            mainAxisSize:
+                                                                MainAxisSize
+                                                                    .min,
+                                                            crossAxisAlignment:
+                                                                CrossAxisAlignment
+                                                                    .start,
+                                                            children: [
+                                                              Text(
+                                                                'التاريخ: $date',
+                                                              ),
+                                                              const SizedBox(
+                                                                height: 8,
+                                                              ),
+                                                              Text(
+                                                                'الجهة: ${party?['name'] ?? ''}',
+                                                              ),
+                                                              const SizedBox(
+                                                                height: 8,
+                                                              ),
+                                                              Text(
+                                                                'المبلغ: ${row['amount'] ?? 0} ${row['currency'] ?? ''}',
+                                                              ),
+                                                              const SizedBox(
+                                                                height: 8,
+                                                              ),
+                                                              Text(
+                                                                'البيان: ${row['notes'] ?? ''}',
+                                                              ),
+                                                            ],
+                                                          ),
+                                                          actions: [
+                                                            TextButton(
+                                                              onPressed: () =>
+                                                                  Navigator.pop(
+                                                                    dialogContext,
+                                                                  ),
+                                                              child: const Text(
+                                                                'إغلاق',
+                                                              ),
+                                                            ),
+                                                          ],
+                                                        ),
+                                                      );
+                                                    }
+                                                  },
+                                            child: Column(
+                                              children: [
+                                                Container(
+                                                  color: index.isEven
+                                                      ? null
+                                                      : Theme.of(context)
+                                                            .colorScheme
+                                                            .surfaceContainerLowest,
+                                                  child: Row(
+                                                    crossAxisAlignment:
+                                                        CrossAxisAlignment
+                                                            .start,
+                                                    children: [
+                                                      cell(date, dateFlex),
+                                                      cell(
+                                                        document,
+                                                        documentFlex,
+                                                      ),
+
+                                                      Expanded(
+                                                        flex: descriptionFlex,
+                                                        child: Row(
+                                                          children: [
+                                                            if (invoice)
+                                                              InkWell(
+                                                                onTap: () {
+                                                                  final id =
+                                                                      row['id']
+                                                                          ?.toString() ??
+                                                                      '';
+                                                                  if (id
+                                                                      .isEmpty) {
+                                                                    return;
+                                                                  }
+                                                                  setState(() {
+                                                                    if (statementExpandedInvoice ==
+                                                                        id) {
+                                                                      statementExpandedInvoice =
+                                                                          null;
+                                                                      statementExpandedItems =
+                                                                          null;
+                                                                    } else {
+                                                                      statementExpandedInvoice =
+                                                                          id;
+                                                                      statementExpandedItems =
+                                                                          fetchStatementItems(
+                                                                            id,
+                                                                            isCustomer,
+                                                                          );
+                                                                    }
+                                                                  });
+                                                                },
+                                                                child: Padding(
+                                                                  padding:
+                                                                      const EdgeInsets.all(
+                                                                        4,
+                                                                      ),
+                                                                  child: Icon(
+                                                                    statementExpandedInvoice ==
+                                                                            row['id']
+                                                                                ?.toString()
+                                                                        ? Icons
+                                                                              .keyboard_arrow_down
+                                                                        : Icons
+                                                                              .keyboard_arrow_left,
+                                                                    size: 19,
+                                                                  ),
+                                                                ),
+                                                              ),
+                                                            Expanded(
+                                                              child: Text(
+                                                                row['notes']
+                                                                        ?.toString() ??
+                                                                    document,
+                                                                softWrap: true,
+                                                                style: TextStyle(
+                                                                  fontSize:
+                                                                      fontSize,
+                                                                ),
+                                                              ),
+                                                            ),
+                                                          ],
+                                                        ),
+                                                      ),
+
+                                                      amountCell(
+                                                        row['_debitUsd']
+                                                            as double,
+                                                        row['_debitSyp']
+                                                            as double,
+                                                      ),
+                                                      amountCell(
+                                                        row['_creditUsd']
+                                                            as double,
+                                                        row['_creditSyp']
+                                                            as double,
+                                                      ),
+                                                      amountCell(
+                                                        row['_balanceUsd']
+                                                            as double,
+                                                        row['_balanceSyp']
+                                                            as double,
+                                                      ),
+                                                    ],
+                                                  ),
+                                                ),
+
+                                                if (invoice &&
+                                                    statementExpandedInvoice ==
+                                                        row['id']?.toString())
+                                                  FutureBuilder<
+                                                    List<Map<String, dynamic>>
+                                                  >(
+                                                    future:
+                                                        statementExpandedItems,
+                                                    builder: (context, snapshot) {
+                                                      if (snapshot.hasError) {
+                                                        return Text(
+                                                          'خطأ في تحميل المواد: ${snapshot.error}',
+                                                        );
+                                                      }
+                                                      if (!snapshot.hasData) {
+                                                        return const LinearProgressIndicator();
+                                                      }
+                                                      final items =
+                                                          snapshot.data!;
+                                                      return Padding(
+                                                        padding:
+                                                            const EdgeInsets.all(
+                                                              8,
+                                                            ),
+                                                        child: Column(
+                                                          children: [
+                                                            Row(
+                                                              children: const [
+                                                                Expanded(
+                                                                  flex: 4,
+                                                                  child: Text(
+                                                                    'المادة',
+                                                                  ),
+                                                                ),
+                                                                Expanded(
+                                                                  flex: 2,
+                                                                  child: Text(
+                                                                    'الكمية',
+                                                                  ),
+                                                                ),
+                                                                Expanded(
+                                                                  flex: 2,
+                                                                  child: Text(
+                                                                    'السعر',
+                                                                  ),
+                                                                ),
+                                                                Expanded(
+                                                                  flex: 2,
+                                                                  child: Text(
+                                                                    'الإجمالي',
+                                                                  ),
+                                                                ),
+                                                              ],
+                                                            ),
+                                                            const Divider(),
+                                                            ...items.map((
+                                                              item,
+                                                            ) {
+                                                              final quantity =
+                                                                  (item['quantity']
+                                                                          as num?)
+                                                                      ?.toDouble() ??
+                                                                  0;
+                                                              final price =
+                                                                  ((item[isCustomer
+                                                                                  ? 'unit_price'
+                                                                                  : 'unit_cost'] ??
+                                                                              item['unit_price'] ??
+                                                                              item['unit_cost'])
+                                                                          as num?)
+                                                                      ?.toDouble() ??
+                                                                  0;
+                                                              final total =
+                                                                  (item['total']
+                                                                          as num?)
+                                                                      ?.toDouble() ??
+                                                                  quantity *
+                                                                      price;
+                                                              final currency =
+                                                                  item['currency']
+                                                                      ?.toString() ??
+                                                                  'USD';
+
+                                                              return Padding(
+                                                                padding:
+                                                                    const EdgeInsets.symmetric(
+                                                                      vertical:
+                                                                          4,
+                                                                    ),
+                                                                child: Row(
+                                                                  children: [
+                                                                    Expanded(
+                                                                      flex: 4,
+                                                                      child: Text(
+                                                                        item['_name']?.toString() ??
+                                                                            '',
+                                                                      ),
+                                                                    ),
+                                                                    Expanded(
+                                                                      flex: 2,
+                                                                      child: Text(
+                                                                        quantity
+                                                                            .toString(),
+                                                                      ),
+                                                                    ),
+                                                                    Expanded(
+                                                                      flex: 2,
+                                                                      child: Text(
+                                                                        '$price $currency',
+                                                                      ),
+                                                                    ),
+                                                                    Expanded(
+                                                                      flex: 2,
+                                                                      child: Text(
+                                                                        '$total $currency',
+                                                                      ),
+                                                                    ),
+                                                                  ],
+                                                                ),
+                                                              );
+                                                            }),
+                                                          ],
+                                                        ),
+                                                      );
+                                                    },
+                                                  ),
+                                              ],
+                                            ),
+                                          );
+                                        },
+                                      ),
+                                    ),
+                                  ],
+                                );
+                              },
+                            ),
+                          ),
+                          const Divider(),
+                          ListTile(
+                            title: Text(
+                              accountingStatementToDate == null
+                                  ? 'الرصيد الحالي'
+                                  : 'الرصيد حتى نهاية الفترة',
+                              style: const TextStyle(
+                                fontWeight: FontWeight.bold,
+                              ),
+                            ),
+                            subtitle: Row(
+                              mainAxisSize: MainAxisSize.min,
+                              children: [
+                                Flexible(
+                                  child: Text(
+                                    '${balanceSyp.toStringAsFixed(0)} SYP',
+                                    textAlign: TextAlign.center,
+                                    style: const TextStyle(
+                                      fontWeight: FontWeight.bold,
+                                    ),
+                                  ),
+                                ),
+                                const Padding(
+                                  padding: EdgeInsets.symmetric(horizontal: 12),
+                                  child: Text('|'),
+                                ),
+                                Flexible(
+                                  child: Text(
+                                    '${balanceUsd.toStringAsFixed(2)} USD',
+                                    textAlign: TextAlign.center,
+                                    style: const TextStyle(
+                                      fontWeight: FontWeight.bold,
+                                    ),
+                                  ),
+                                ),
+                              ],
+                            ),
+                            trailing: Row(
+                              mainAxisSize: MainAxisSize.min,
+                              children: [
+                                IconButton(
+                                  tooltip: 'طباعة كشف الحساب PDF',
+                                  icon: const Icon(Icons.print),
+                                  onPressed: () {
+                                    if (party == null) return;
+                                    printAccountingStatementPdf(
+                                      partyName:
+                                          party['name']?.toString() ?? '',
+                                      isCustomer: isCustomer,
+                                      rows: rows,
+                                      balanceUsd: balanceUsd,
+                                      balanceSyp: balanceSyp,
+                                    );
+                                  },
+                                ),
+                              ],
+                            ),
+                          ),
+                        ],
+                      );
+                    },
+                  ),
+          ),
+        ],
+      ),
+    );
+  }
+
   String accountingSummaryPeriod = 'month';
+
+  final TextEditingController debtReportSearchController =
+      TextEditingController();
+  String debtReportPartyFilter = 'all';
+  bool debtReportOnlyDebtors = false;
+  String debtReportSort = 'name';
+
+  Future<void> printAccountingReportPdf({
+    required String title,
+    required List<List<String>> rows,
+    required List<String> headers,
+    required String periodLabel,
+  }) async {
+    try {
+      final regular = await PdfGoogleFonts.notoNaskhArabicRegular();
+      final bold = await PdfGoogleFonts.notoNaskhArabicBold();
+      final document = pw.Document();
+
+      final now = DateTime.now();
+      final printedAt =
+          '${now.year}-${now.month.toString().padLeft(2, '0')}-${now.day.toString().padLeft(2, '0')}';
+
+      pw.Widget pdfCell(String value, {bool heading = false}) {
+        return pw.Container(
+          padding: const pw.EdgeInsets.symmetric(horizontal: 7, vertical: 9),
+          alignment: pw.Alignment.centerRight,
+          child: pw.Text(
+            value,
+            textDirection: pw.TextDirection.rtl,
+            style: pw.TextStyle(
+              font: heading ? bold : regular,
+              fontSize: heading ? 10 : 9,
+              color: heading ? PdfColors.white : PdfColors.black,
+            ),
+          ),
+        );
+      }
+
+      document.addPage(
+        pw.MultiPage(
+          pageFormat: PdfPageFormat.a4,
+          margin: const pw.EdgeInsets.all(30),
+          textDirection: pw.TextDirection.rtl,
+          theme: pw.ThemeData.withFont(base: regular, bold: bold),
+          header: (context) => pw.Container(
+            padding: const pw.EdgeInsets.only(bottom: 10),
+            margin: const pw.EdgeInsets.only(bottom: 12),
+            decoration: const pw.BoxDecoration(
+              border: pw.Border(
+                bottom: pw.BorderSide(color: PdfColors.blueGrey700, width: 1.5),
+              ),
+            ),
+            child: pw.Row(
+              mainAxisAlignment: pw.MainAxisAlignment.spaceBetween,
+              children: [
+                pw.Column(
+                  crossAxisAlignment: pw.CrossAxisAlignment.start,
+                  children: [
+                    pw.Text(
+                      'قصر الحجاج لخدمات الإنترنت',
+                      style: pw.TextStyle(
+                        font: bold,
+                        fontSize: 17,
+                        color: PdfColors.blueGrey900,
+                      ),
+                    ),
+                    pw.SizedBox(height: 4),
+                    pw.Text(
+                      'التقارير المحاسبية',
+                      style: pw.TextStyle(
+                        font: regular,
+                        fontSize: 10,
+                        color: PdfColors.grey700,
+                      ),
+                    ),
+                  ],
+                ),
+                pw.Text(
+                  printedAt,
+                  style: pw.TextStyle(font: regular, fontSize: 10),
+                ),
+              ],
+            ),
+          ),
+          footer: (context) => pw.Container(
+            padding: const pw.EdgeInsets.only(top: 8),
+            decoration: const pw.BoxDecoration(
+              border: pw.Border(
+                top: pw.BorderSide(color: PdfColors.grey400, width: 0.5),
+              ),
+            ),
+            child: pw.Row(
+              mainAxisAlignment: pw.MainAxisAlignment.spaceBetween,
+              children: [
+                pw.Text(
+                  'قصر الحجاج لخدمات الإنترنت',
+                  style: pw.TextStyle(
+                    font: regular,
+                    fontSize: 8,
+                    color: PdfColors.grey700,
+                  ),
+                ),
+                pw.Text(
+                  'صفحة ${context.pageNumber} من ${context.pagesCount}',
+                  style: pw.TextStyle(font: regular, fontSize: 8),
+                ),
+              ],
+            ),
+          ),
+          build: (context) => [
+            pw.Container(
+              padding: const pw.EdgeInsets.all(14),
+              decoration: pw.BoxDecoration(
+                color: PdfColors.grey100,
+                borderRadius: pw.BorderRadius.circular(6),
+              ),
+              child: pw.Column(
+                crossAxisAlignment: pw.CrossAxisAlignment.start,
+                children: [
+                  pw.Text(
+                    title,
+                    style: pw.TextStyle(
+                      font: bold,
+                      fontSize: 16,
+                      color: PdfColors.blueGrey900,
+                    ),
+                  ),
+                  pw.SizedBox(height: 8),
+                  pw.Text(
+                    periodLabel,
+                    style: pw.TextStyle(font: regular, fontSize: 10),
+                  ),
+                  pw.SizedBox(height: 4),
+                  pw.Text(
+                    'تاريخ إصدار التقرير: $printedAt',
+                    style: pw.TextStyle(font: regular, fontSize: 10),
+                  ),
+                ],
+              ),
+            ),
+            pw.SizedBox(height: 18),
+            pw.Table(
+              border: pw.TableBorder.all(color: PdfColors.grey300, width: 0.5),
+              columnWidths: {
+                for (var i = 0; i < headers.length; i++)
+                  i: const pw.FlexColumnWidth(),
+              },
+              children: [
+                pw.TableRow(
+                  decoration: const pw.BoxDecoration(
+                    color: PdfColors.blueGrey800,
+                  ),
+                  children: [
+                    for (final header in headers)
+                      pdfCell(header, heading: true),
+                  ],
+                ),
+                for (var i = 0; i < rows.length; i++)
+                  pw.TableRow(
+                    decoration: pw.BoxDecoration(
+                      color: i.isEven ? PdfColors.white : PdfColors.grey100,
+                    ),
+                    children: [for (final value in rows[i]) pdfCell(value)],
+                  ),
+              ],
+            ),
+            pw.SizedBox(height: 35),
+            pw.Row(
+              mainAxisAlignment: pw.MainAxisAlignment.spaceBetween,
+              children: [
+                pw.Column(
+                  children: [
+                    pw.Text(
+                      'توقيع المحاسب',
+                      style: pw.TextStyle(font: bold, fontSize: 11),
+                    ),
+                    pw.SizedBox(height: 25),
+                    pw.Text(
+                      '........................',
+                      style: pw.TextStyle(font: regular, fontSize: 10),
+                    ),
+                  ],
+                ),
+                pw.Column(
+                  children: [
+                    pw.Text(
+                      'الختم والتوقيع',
+                      style: pw.TextStyle(font: bold, fontSize: 11),
+                    ),
+                    pw.SizedBox(height: 25),
+                    pw.Text(
+                      '........................',
+                      style: pw.TextStyle(font: regular, fontSize: 10),
+                    ),
+                  ],
+                ),
+              ],
+            ),
+          ],
+        ),
+      );
+
+      await Printing.layoutPdf(
+        onLayout: (format) async => document.save(),
+        name: 'Accounting_Report',
+      );
+    } catch (e) {
+      if (!mounted) return;
+      ScaffoldMessenger.of(context)
+          .showSnackBar(SnackBar(content: Text('تعذر طباعة التقرير: $e')));
+    }
+  }
+
+  Widget buildAccountingReports() {
+    final isArabic = widget.currentUser.language == 'ar';
+    final db = Supabase.instance.client;
+
+    double amountOf(Map<String, dynamic> row, String field) {
+      final value = row[field];
+      if (value is num) return value.toDouble();
+      return double.tryParse(value?.toString() ?? '') ?? 0;
+    }
+
+    return FutureBuilder<List<List<Map<String, dynamic>>>>(
+      future: Future.wait([
+        db
+            .from('accounting_sales')
+            .select(
+              'id,invoice_date,status,customer_id,total_usd,total_syp,paid_usd,paid_syp',
+            )
+            .eq('created_by', widget.currentUser.id)
+            .then((rows) => List<Map<String, dynamic>>.from(rows)),
+        db
+            .from('accounting_purchases')
+            .select(
+              'invoice_date,status,supplier_id,total_usd,total_syp,paid_usd,paid_syp',
+            )
+            .eq('created_by', widget.currentUser.id)
+            .then((rows) => List<Map<String, dynamic>>.from(rows)),
+        db
+            .from('accounting_transactions')
+            .select(
+              'transaction_date,transaction_type,amount,currency,customer_id,supplier_id',
+            )
+            .eq('created_by', widget.currentUser.id)
+            .then((rows) => List<Map<String, dynamic>>.from(rows)),
+        db
+            .from('accounting_customers')
+            .select('id,name,opening_balance,currency')
+            .eq('created_by', widget.currentUser.id)
+            .then((rows) => List<Map<String, dynamic>>.from(rows)),
+        db
+            .from('accounting_suppliers')
+            .select('id,name,opening_balance,currency')
+            .eq('created_by', widget.currentUser.id)
+            .then((rows) => List<Map<String, dynamic>>.from(rows)),
+        db
+            .from('accounting_sale_items')
+            .select(
+              'sale_id,product_id,quantity,unit_cost,currency,'
+              'accounting_sales!inner(created_by)',
+            )
+            .eq('accounting_sales.created_by', widget.currentUser.id)
+            .then((rows) => List<Map<String, dynamic>>.from(rows)),
+        db
+            .from('accounting_expenses')
+            .select('expense_date,amount,currency')
+            .eq('created_by', widget.currentUser.id)
+            .then((rows) => List<Map<String, dynamic>>.from(rows)),
+      ]),
+      builder: (context, snapshot) {
+        if (snapshot.hasError) {
+          return Center(
+            child: Text(
+              isArabic
+                  ? 'تعذر تحميل التقارير: ${snapshot.error}'
+                  : 'Unable to load reports: ${snapshot.error}',
+            ),
+          );
+        }
+
+        if (!snapshot.hasData) {
+          return const Center(child: CircularProgressIndicator());
+        }
+
+        final now = DateTime.now();
+        final today = DateTime(now.year, now.month, now.day);
+
+        bool inPeriod(String? rawDate) {
+          if (accountingSummaryPeriod == 'all') return true;
+
+          final parsed = DateTime.tryParse(rawDate ?? '');
+          if (parsed == null) return false;
+
+          final date = DateTime(parsed.year, parsed.month, parsed.day);
+
+          if (accountingSummaryPeriod == 'today') {
+            return date == today;
+          }
+
+          if (accountingSummaryPeriod == 'week') {
+            final startOfWeek = today.subtract(
+              Duration(days: (today.weekday - DateTime.saturday + 7) % 7),
+            );
+            return !date.isBefore(startOfWeek) && !date.isAfter(today);
+          }
+
+          if (accountingSummaryPeriod == 'month') {
+            return date.year == today.year &&
+                date.month == today.month &&
+                !date.isAfter(today);
+          }
+
+          return true;
+        }
+
+        final sales = snapshot.data![0]
+            .where(
+              (row) =>
+                  row['status']?.toString() != 'cancelled' &&
+                  inPeriod(row['invoice_date']?.toString()),
+            )
+            .toList();
+
+        final purchases = snapshot.data![1]
+            .where(
+              (row) =>
+                  row['status']?.toString() != 'cancelled' &&
+                  inPeriod(row['invoice_date']?.toString()),
+            )
+            .toList();
+
+        final transactions = snapshot.data![2]
+            .where((row) => inPeriod(row['transaction_date']?.toString()))
+            .toList();
+
+        // حساب مجمل الربح من أصناف فواتير البيع ضمن الفترة المحددة.
+        final profitSaleIds = sales
+            .map((sale) => sale['id']?.toString() ?? '')
+            .where((id) => id.isNotEmpty)
+            .toSet();
+
+        final saleItemsForProfit = snapshot.data![5]
+            .where(
+              (item) =>
+                  profitSaleIds.contains(item['sale_id']?.toString() ?? ''),
+            )
+            .toList();
+
+        double costUsd = 0;
+        double costSyp = 0;
+
+        for (final item in saleItemsForProfit) {
+          final quantity = amountOf(item, 'quantity');
+          final unitCost = amountOf(item, 'unit_cost');
+          final currency = item['currency']?.toString().toUpperCase() ?? 'USD';
+
+          final cost = quantity * unitCost;
+
+          if (currency == 'USD') {
+            costUsd += cost;
+          } else if (currency == 'SYP') {
+            costSyp += cost;
+          }
+        }
+
+        final revenueUsd = sales.fold<double>(
+          0,
+          (sum, sale) => sum + amountOf(sale, 'total_usd'),
+        );
+
+        final revenueSyp = sales.fold<double>(
+          0,
+          (sum, sale) => sum + amountOf(sale, 'total_syp'),
+        );
+
+        final grossProfitUsd = revenueUsd - costUsd;
+        final grossProfitSyp = revenueSyp - costSyp;
+
+        final operatingExpenses = snapshot.data![6]
+            .where((row) => inPeriod(row['expense_date']?.toString()))
+            .toList();
+
+        double operatingExpensesTotal(String currency) {
+          return operatingExpenses
+              .where(
+                (row) => row['currency']?.toString().toUpperCase() == currency,
+              )
+              .fold<double>(0, (sum, row) => sum + amountOf(row, 'amount'));
+        }
+
+        final expensesUsd = operatingExpensesTotal('USD');
+        final expensesSyp = operatingExpensesTotal('SYP');
+
+        final netProfitUsd = grossProfitUsd - expensesUsd;
+        final netProfitSyp = grossProfitSyp - expensesSyp;
+
+        double sumField(List<Map<String, dynamic>> rows, String field) {
+          return rows.fold<double>(
+            0,
+            (total, row) => total + amountOf(row, field),
+          );
+        }
+
+        double transactionTotal(String type, String currency) {
+          return transactions
+              .where(
+                (row) =>
+                    row['transaction_type']?.toString() == type &&
+                    row['currency']?.toString().toUpperCase() == currency,
+              )
+              .fold<double>(0, (total, row) => total + amountOf(row, 'amount'));
+        }
+
+        final customers = snapshot.data![3];
+        final suppliers = snapshot.data![4];
+        final allTransactions = snapshot.data![2];
+
+        final debtRows = <Map<String, dynamic>>[];
+
+        void calculateDebts(
+          List<Map<String, dynamic>> parties,
+          String partyType,
+          List<Map<String, dynamic>> invoices,
+          String idField,
+        ) {
+          for (final party in parties) {
+            final id = party['id']?.toString() ?? '';
+            if (id.isEmpty) continue;
+
+            final opening = amountOf(party, 'opening_balance');
+            final openingCurrency =
+                party['currency']?.toString().toUpperCase() ?? 'USD';
+
+            double usd = openingCurrency == 'USD' ? opening : 0;
+            double syp = openingCurrency == 'SYP' ? opening : 0;
+
+            for (final invoice in invoices) {
+              if (invoice[idField]?.toString() != id ||
+                  invoice['status']?.toString() == 'cancelled') {
+                continue;
+              }
+
+              usd +=
+                  amountOf(invoice, 'total_usd') -
+                  amountOf(invoice, 'paid_usd');
+              syp +=
+                  amountOf(invoice, 'total_syp') -
+                  amountOf(invoice, 'paid_syp');
+            }
+
+            for (final transaction in allTransactions) {
+              if (transaction[idField]?.toString() != id) continue;
+
+              final type = transaction['transaction_type']?.toString();
+              final amount = amountOf(transaction, 'amount');
+              final currency = transaction['currency']
+                  ?.toString()
+                  .toUpperCase();
+
+              double change = 0;
+
+              if (partyType == 'customer') {
+                if (type == 'customer_receipt') change = -amount;
+                if (type == 'customer_payment') change = amount;
+              } else {
+                if (type == 'supplier_payment') change = -amount;
+                if (type == 'supplier_receipt') change = amount;
+              }
+
+              if (currency == 'USD') usd += change;
+              if (currency == 'SYP') syp += change;
+            }
+
+            debtRows.add({
+              'id': id,
+              'name': party['name']?.toString() ?? '',
+              'type': partyType,
+              'usd': usd,
+              'syp': syp,
+            });
+          }
+        }
+
+        calculateDebts(customers, 'customer', snapshot.data![0], 'customer_id');
+
+        calculateDebts(suppliers, 'supplier', snapshot.data![1], 'supplier_id');
+
+        double totalDebt(String type, String currency) {
+          return debtRows.where((row) => row['type'] == type).fold<double>(0, (
+            sum,
+            row,
+          ) {
+            final value = row[currency] as double;
+            return sum + (value > 0 ? value : 0);
+          });
+        }
+
+        void openDebtStatement(Map<String, dynamic> row) {
+          final type = row['type'] as String;
+          final id = row['id'] as String;
+
+          setState(() {
+            accountingStatementPartyType = type;
+            accountingStatementPartyId = id;
+            accountingStatementSearch = '';
+            accountingStatementShowResults = false;
+            accountingStatementFromDate = null;
+            accountingStatementToDate = null;
+            accountingStatementFuture = loadAccountingStatementEntries(
+              type,
+              id,
+            );
+            selectedIndex = 21;
+          });
+        }
+
+        final filteredDebtRows = debtRows.where((row) {
+          final name = (row['name'] ?? '').toString().toLowerCase();
+          final search = debtReportSearchController.text.trim().toLowerCase();
+
+          if (search.isNotEmpty && !name.contains(search)) return false;
+
+          if (debtReportPartyFilter != 'all' &&
+              row['type'] != debtReportPartyFilter) {
+            return false;
+          }
+
+          if (debtReportOnlyDebtors) {
+            final usd = row['usd'] as double;
+            final syp = row['syp'] as double;
+            if (usd <= 0 && syp <= 0) return false;
+          }
+
+          return true;
+        }).toList();
+
+        filteredDebtRows.sort((a, b) {
+          if (debtReportSort == 'usd') {
+            return (b['usd'] as double).compareTo(a['usd'] as double);
+          }
+          if (debtReportSort == 'syp') {
+            return (b['syp'] as double).compareTo(a['syp'] as double);
+          }
+          return (a['name'] as String).compareTo(b['name'] as String);
+        });
+
+        final reportPeriodLabel = accountingSummaryPeriod == 'today'
+            ? 'اليوم'
+            : accountingSummaryPeriod == 'week'
+            ? 'الأسبوع'
+            : accountingSummaryPeriod == 'month'
+            ? 'الشهر'
+            : 'الكل';
+
+        Widget printButtons() {
+          return Wrap(
+            spacing: 10,
+            runSpacing: 10,
+            children: [
+              FilledButton.icon(
+                onPressed: () {
+                  printAccountingReportPdf(
+                    title: 'تقرير الأرباح والخسائر',
+                    headers: ['البيان', 'USD', 'SYP'],
+                    rows: [
+                      [
+                        'إجمالي المبيعات',
+                        revenueUsd.toStringAsFixed(2),
+                        revenueSyp.toStringAsFixed(0),
+                      ],
+                      [
+                        'تكلفة البضاعة المباعة',
+                        costUsd.toStringAsFixed(2),
+                        costSyp.toStringAsFixed(0),
+                      ],
+                      [
+                        'مجمل الربح',
+                        grossProfitUsd.toStringAsFixed(2),
+                        grossProfitSyp.toStringAsFixed(0),
+                      ],
+                      [
+                        'المصروفات التشغيلية',
+                        expensesUsd.toStringAsFixed(2),
+                        expensesSyp.toStringAsFixed(0),
+                      ],
+                      [
+                        'صافي الربح',
+                        netProfitUsd.toStringAsFixed(2),
+                        netProfitSyp.toStringAsFixed(0),
+                      ],
+                    ],
+                    periodLabel: 'الفترة: $reportPeriodLabel',
+                  );
+                },
+                icon: const Icon(Icons.assessment_rounded),
+                label: Text(
+                  isArabic ? 'طباعة الأرباح والخسائر' : 'Print Profit & Loss',
+                ),
+              ),
+              ElevatedButton.icon(
+                onPressed: () {
+                  final financialRows = <List<String>>[
+                    [
+                      'إجمالي المبيعات',
+                      sumField(sales, 'total_usd').toStringAsFixed(2),
+                      sumField(sales, 'total_syp').toStringAsFixed(0),
+                    ],
+                    [
+                      'إجمالي المشتريات',
+                      sumField(purchases, 'total_usd').toStringAsFixed(2),
+                      sumField(purchases, 'total_syp').toStringAsFixed(0),
+                    ],
+                    [
+                      'مدفوع فواتير المبيعات',
+                      sumField(sales, 'paid_usd').toStringAsFixed(2),
+                      sumField(sales, 'paid_syp').toStringAsFixed(0),
+                    ],
+                    [
+                      'مدفوع فواتير المشتريات',
+                      sumField(purchases, 'paid_usd').toStringAsFixed(2),
+                      sumField(purchases, 'paid_syp').toStringAsFixed(0),
+                    ],
+                    [
+                      'تحصيلات العملاء',
+                      transactionTotal(
+                        'customer_receipt',
+                        'USD',
+                      ).toStringAsFixed(2),
+                      transactionTotal(
+                        'customer_receipt',
+                        'SYP',
+                      ).toStringAsFixed(0),
+                    ],
+                    [
+                      'مدفوعات الموردين',
+                      transactionTotal(
+                        'supplier_payment',
+                        'USD',
+                      ).toStringAsFixed(2),
+                      transactionTotal(
+                        'supplier_payment',
+                        'SYP',
+                      ).toStringAsFixed(0),
+                    ],
+                    [
+                      'مبالغ مستلمة من الموردين',
+                      transactionTotal(
+                        'supplier_receipt',
+                        'USD',
+                      ).toStringAsFixed(2),
+                      transactionTotal(
+                        'supplier_receipt',
+                        'SYP',
+                      ).toStringAsFixed(0),
+                    ],
+                  ];
+
+                  printAccountingReportPdf(
+                    title: 'التقرير المالي',
+                    headers: ['البيان', 'USD', 'SYP'],
+                    rows: financialRows,
+                    periodLabel: 'الفترة: $reportPeriodLabel',
+                  );
+                },
+                icon: const Icon(Icons.picture_as_pdf_rounded),
+                label: Text(
+                  isArabic ? 'طباعة التقرير المالي' : 'Print Financial Report',
+                ),
+              ),
+              OutlinedButton.icon(
+                onPressed: () {
+                  final debtPrintRows = filteredDebtRows.map((row) {
+                    return [
+                      row['name']?.toString() ?? '',
+                      row['type'] == 'customer' ? 'عميل' : 'مورد',
+                      (row['usd'] as double).toStringAsFixed(2),
+                      (row['syp'] as double).toStringAsFixed(0),
+                    ];
+                  }).toList();
+
+                  printAccountingReportPdf(
+                    title: 'تقرير ديون العملاء والموردين',
+                    headers: ['الاسم', 'النوع', 'USD', 'SYP'],
+                    rows: debtPrintRows,
+                    periodLabel:
+                        'جميع الفترات - الحسابات المعروضة: ${debtPrintRows.length}',
+                  );
+                },
+                icon: const Icon(Icons.print_rounded),
+                label: Text(
+                  isArabic ? 'طباعة تقرير الديون' : 'Print Debt Report',
+                ),
+              ),
+            ],
+          );
+        }
+
+        Widget reportCard(
+          String title,
+          IconData icon,
+          double usd,
+          double syp,
+          Color color,
+        ) {
+          return Card(
+            child: Padding(
+              padding: const EdgeInsets.all(14),
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  Row(
+                    children: [
+                      Icon(icon, color: color),
+                      const SizedBox(width: 8),
+                      Expanded(
+                        child: Text(
+                          title,
+                          style: const TextStyle(fontWeight: FontWeight.bold),
+                        ),
+                      ),
+                    ],
+                  ),
+                  const SizedBox(height: 12),
+                  Text(
+                    '${usd.toStringAsFixed(2)} USD',
+                    style: const TextStyle(
+                      fontSize: 19,
+                      fontWeight: FontWeight.bold,
+                    ),
+                  ),
+                  const SizedBox(height: 5),
+                  Text('${syp.toStringAsFixed(0)} SYP'),
+                ],
+              ),
+            ),
+          );
+        }
+
+        return ListView(
+          padding: const EdgeInsets.all(14),
+          children: [
+            Row(
+              children: [
+                IconButton(
+                  tooltip: isArabic ? 'رجوع' : 'Back',
+                  onPressed: () {
+                    setState(() {
+                      selectedIndex = 14;
+                    });
+                  },
+                  icon: const Icon(Icons.arrow_back_rounded),
+                ),
+                const SizedBox(width: 8),
+                Expanded(
+                  child: Text(
+                    isArabic ? 'التقارير المحاسبية' : 'Accounting Reports',
+                    style: const TextStyle(
+                      fontSize: 23,
+                      fontWeight: FontWeight.bold,
+                    ),
+                  ),
+                ),
+              ],
+            ),
+            const SizedBox(height: 12),
+            Wrap(
+              spacing: 8,
+              children: [
+                for (final period in [
+                  ('today', 'اليوم', 'Today'),
+                  ('week', 'الأسبوع', 'Week'),
+                  ('month', 'الشهر', 'Month'),
+                  ('all', 'الكل', 'All'),
+                ])
+                  ChoiceChip(
+                    label: Text(isArabic ? period.$2 : period.$3),
+                    selected: accountingSummaryPeriod == period.$1,
+                    onSelected: (_) {
+                      setState(() {
+                        accountingSummaryPeriod = period.$1;
+                      });
+                    },
+                  ),
+              ],
+            ),
+            const SizedBox(height: 14),
+            printButtons(),
+            const SizedBox(height: 14),
+            LayoutBuilder(
+              builder: (context, constraints) {
+                final columns = constraints.maxWidth >= 900 ? 3 : 2;
+                final cardWidth =
+                    (constraints.maxWidth - (columns - 1) * 8) / columns;
+
+                return Wrap(
+                  spacing: 8,
+                  runSpacing: 8,
+                  children: [
+                    SizedBox(
+                      width: cardWidth,
+                      child: reportCard(
+                        isArabic ? 'إجمالي المبيعات' : 'Total Sales',
+                        Icons.trending_up_rounded,
+                        sumField(sales, 'total_usd'),
+                        sumField(sales, 'total_syp'),
+                        Colors.green,
+                      ),
+                    ),
+                    SizedBox(
+                      width: cardWidth,
+                      child: reportCard(
+                        isArabic ? 'إجمالي المشتريات' : 'Total Purchases',
+                        Icons.shopping_cart_rounded,
+                        sumField(purchases, 'total_usd'),
+                        sumField(purchases, 'total_syp'),
+                        Colors.blue,
+                      ),
+                    ),
+                    SizedBox(
+                      width: cardWidth,
+                      child: reportCard(
+                        isArabic
+                            ? 'مدفوع داخل فواتير المبيعات'
+                            : 'Sales Invoice Paid',
+                        Icons.payments_rounded,
+                        sumField(sales, 'paid_usd'),
+                        sumField(sales, 'paid_syp'),
+                        Colors.teal,
+                      ),
+                    ),
+                    SizedBox(
+                      width: cardWidth,
+                      child: reportCard(
+                        isArabic
+                            ? 'مدفوع داخل فواتير المشتريات'
+                            : 'Purchases Invoice Paid',
+                        Icons.account_balance_wallet_rounded,
+                        sumField(purchases, 'paid_usd'),
+                        sumField(purchases, 'paid_syp'),
+                        Colors.indigo,
+                      ),
+                    ),
+                    SizedBox(
+                      width: cardWidth,
+                      child: reportCard(
+                        isArabic ? 'تحصيلات العملاء' : 'Customer Receipts',
+                        Icons.call_received_rounded,
+                        transactionTotal('customer_receipt', 'USD'),
+                        transactionTotal('customer_receipt', 'SYP'),
+                        Colors.green,
+                      ),
+                    ),
+                    SizedBox(
+                      width: cardWidth,
+                      child: reportCard(
+                        isArabic ? 'مدفوعات الموردين' : 'Supplier Payments',
+                        Icons.call_made_rounded,
+                        transactionTotal('supplier_payment', 'USD'),
+                        transactionTotal('supplier_payment', 'SYP'),
+                        Colors.orange,
+                      ),
+                    ),
+                    SizedBox(
+                      width: cardWidth,
+                      child: reportCard(
+                        isArabic
+                            ? 'مبالغ مستلمة من الموردين'
+                            : 'Supplier Receipts',
+                        Icons.south_west_rounded,
+                        transactionTotal('supplier_receipt', 'USD'),
+                        transactionTotal('supplier_receipt', 'SYP'),
+                        Colors.purple,
+                      ),
+                    ),
+                  ],
+                );
+              },
+            ),
+            const SizedBox(height: 12),
+            Text(
+              isArabic
+                  ? 'ملاحظة: المبالغ المدفوعة داخل الفواتير معروضة بشكل مستقل عن الحركات المالية لتجنب تكرار احتسابها.'
+                  : 'Note: Invoice payments are shown separately from financial transactions to avoid double counting.',
+              style: const TextStyle(fontSize: 12),
+            ),
+
+            const SizedBox(height: 24),
+            Text(
+              isArabic ? 'تقرير الأرباح والخسائر' : 'Profit & Loss Report',
+              style: const TextStyle(fontSize: 20, fontWeight: FontWeight.bold),
+            ),
+            const SizedBox(height: 12),
+            LayoutBuilder(
+              builder: (context, constraints) {
+                final columns = constraints.maxWidth >= 900 ? 3 : 2;
+                final width =
+                    (constraints.maxWidth - (columns - 1) * 8) / columns;
+
+                return Wrap(
+                  spacing: 8,
+                  runSpacing: 8,
+                  children: [
+                    SizedBox(
+                      width: width,
+                      child: reportCard(
+                        isArabic ? 'إجمالي المبيعات' : 'Total Sales',
+                        Icons.trending_up_rounded,
+                        revenueUsd,
+                        revenueSyp,
+                        Colors.green,
+                      ),
+                    ),
+                    SizedBox(
+                      width: width,
+                      child: reportCard(
+                        isArabic
+                            ? 'تكلفة البضاعة المباعة'
+                            : 'Cost of Goods Sold',
+                        Icons.inventory_2_rounded,
+                        costUsd,
+                        costSyp,
+                        Colors.orange,
+                      ),
+                    ),
+                    SizedBox(
+                      width: width,
+                      child: reportCard(
+                        isArabic ? 'مجمل الربح' : 'Gross Profit',
+                        Icons.account_balance_rounded,
+                        grossProfitUsd,
+                        grossProfitSyp,
+                        Colors.teal,
+                      ),
+                    ),
+                    SizedBox(
+                      width: width,
+                      child: reportCard(
+                        isArabic ? 'المصروفات التشغيلية' : 'Operating Expenses',
+                        Icons.receipt_long_rounded,
+                        expensesUsd,
+                        expensesSyp,
+                        Colors.deepOrange,
+                      ),
+                    ),
+                    SizedBox(
+                      width: width,
+                      child: reportCard(
+                        isArabic ? 'صافي الربح' : 'Net Profit',
+                        Icons.account_balance_wallet_rounded,
+                        netProfitUsd,
+                        netProfitSyp,
+                        Colors.indigo,
+                      ),
+                    ),
+                  ],
+                );
+              },
+            ),
+            const SizedBox(height: 12),
+            Text(
+              isArabic
+                  ? 'صافي الربح = مجمل الربح - المصروفات التشغيلية. تُحسب كل عملة بشكل مستقل.'
+                  : 'Net profit = gross profit minus operating expenses. Each currency is calculated separately.',
+              style: const TextStyle(fontSize: 12),
+            ),
+            const SizedBox(height: 24),
+            Text(
+              isArabic
+                  ? 'تقرير ديون العملاء والموردين'
+                  : 'Customer and Supplier Debts',
+              style: const TextStyle(fontSize: 20, fontWeight: FontWeight.bold),
+            ),
+            const SizedBox(height: 8),
+            Text(
+              isArabic
+                  ? 'الأرصدة تشمل جميع الفواتير والحركات المالية.'
+                  : 'Balances include all invoices and transactions.',
+            ),
+            const SizedBox(height: 12),
+            LayoutBuilder(
+              builder: (context, constraints) {
+                final width = (constraints.maxWidth - 8) / 2;
+                return Wrap(
+                  spacing: 8,
+                  runSpacing: 8,
+                  children: [
+                    SizedBox(
+                      width: width,
+                      child: reportCard(
+                        isArabic ? 'ديون العملاء' : 'Customer Debts',
+                        Icons.people_alt_rounded,
+                        totalDebt('customer', 'usd'),
+                        totalDebt('customer', 'syp'),
+                        Colors.red,
+                      ),
+                    ),
+                    SizedBox(
+                      width: width,
+                      child: reportCard(
+                        isArabic ? 'ديون الموردين' : 'Supplier Debts',
+                        Icons.local_shipping_rounded,
+                        totalDebt('supplier', 'usd'),
+                        totalDebt('supplier', 'syp'),
+                        Colors.deepOrange,
+                      ),
+                    ),
+                  ],
+                );
+              },
+            ),
+            const SizedBox(height: 12),
+
+            const SizedBox(height: 12),
+            TextField(
+              controller: debtReportSearchController,
+              decoration: InputDecoration(
+                prefixIcon: const Icon(Icons.search_rounded),
+                labelText: isArabic
+                    ? 'بحث عن عميل أو مورد'
+                    : 'Search customers or suppliers',
+                border: const OutlineInputBorder(),
+              ),
+              onChanged: (_) => setState(() {}),
+            ),
+            const SizedBox(height: 10),
+            Wrap(
+              spacing: 8,
+              runSpacing: 8,
+              children: [
+                for (final item in [
+                  ('all', 'الكل', 'All'),
+                  ('customer', 'العملاء', 'Customers'),
+                  ('supplier', 'الموردون', 'Suppliers'),
+                ])
+                  ChoiceChip(
+                    label: Text(isArabic ? item.$2 : item.$3),
+                    selected: debtReportPartyFilter == item.$1,
+                    onSelected: (_) {
+                      setState(() {
+                        debtReportPartyFilter = item.$1;
+                      });
+                    },
+                  ),
+                FilterChip(
+                  label: Text(isArabic ? 'المدينون فقط' : 'Debtors Only'),
+                  selected: debtReportOnlyDebtors,
+                  onSelected: (value) {
+                    setState(() {
+                      debtReportOnlyDebtors = value;
+                    });
+                  },
+                ),
+              ],
+            ),
+            const SizedBox(height: 10),
+            DropdownButtonFormField<String>(
+              initialValue: debtReportSort,
+              decoration: InputDecoration(
+                labelText: isArabic ? 'ترتيب حسب' : 'Sort by',
+                border: const OutlineInputBorder(),
+              ),
+              items: [
+                DropdownMenuItem(
+                  value: 'name',
+                  child: Text(isArabic ? 'الاسم' : 'Name'),
+                ),
+                DropdownMenuItem(
+                  value: 'usd',
+                  child: Text(isArabic ? 'الدين بالدولار' : 'USD Debt'),
+                ),
+                DropdownMenuItem(
+                  value: 'syp',
+                  child: Text(isArabic ? 'الدين بالليرة' : 'SYP Debt'),
+                ),
+              ],
+              onChanged: (value) {
+                if (value == null) return;
+                setState(() {
+                  debtReportSort = value;
+                });
+              },
+            ),
+            const SizedBox(height: 12),
+            Text(
+              isArabic
+                  ? 'عدد الحسابات: ${filteredDebtRows.length}'
+                  : 'Accounts: ${filteredDebtRows.length}',
+            ),
+            if (filteredDebtRows.isEmpty)
+              Padding(
+                padding: const EdgeInsets.all(20),
+                child: Center(
+                  child: Text(
+                    isArabic ? 'لا توجد حسابات مطابقة' : 'No matching accounts',
+                  ),
+                ),
+              ),
+            for (final row in filteredDebtRows)
+              Card(
+                child: ListTile(
+                  leading: Icon(
+                    row['type'] == 'customer'
+                        ? Icons.person_outline_rounded
+                        : Icons.local_shipping_outlined,
+                  ),
+                  title: Text(row['name'] as String),
+                  subtitle: Text(
+                    '${(row['usd'] as double).toStringAsFixed(2)} USD'
+                    ' | ${(row['syp'] as double).toStringAsFixed(0)} SYP',
+                  ),
+                  trailing: IconButton(
+                    tooltip: isArabic ? 'كشف الحساب' : 'Account Statement',
+                    icon: const Icon(Icons.receipt_long_rounded),
+                    onPressed: () => openDebtStatement(row),
+                  ),
+                  onTap: () => openDebtStatement(row),
+                ),
+              ),
+          ],
+        );
+      },
+    );
+  }
+
+  Widget buildAccountingExpenses() {
+    final ar = widget.currentUser.language == 'ar';
+    final db = Supabase.instance.client;
+    final userId = widget.currentUser.id;
+
+    Future<List<Map<String, dynamic>>> loadExpenses() async {
+      final rows = await db
+          .from('accounting_expenses')
+          .select()
+          .eq('created_by', userId)
+          .order('expense_date', ascending: false);
+
+      return List<Map<String, dynamic>>.from(rows);
+    }
+
+    Future<void> openExpenseDialog({Map<String, dynamic>? existing}) async {
+      final editing = existing != null;
+      final description = TextEditingController(
+        text: existing?['description']?.toString() ?? '',
+      );
+      final amount = TextEditingController(
+        text: existing?['amount']?.toString() ?? '',
+      );
+      final notes = TextEditingController(
+        text: existing?['notes']?.toString() ?? '',
+      );
+
+      String category = existing?['category']?.toString() ?? 'كهرباء';
+      String currency = existing?['currency']?.toString() ?? 'USD';
+      String paymentMethod = existing?['payment_method']?.toString() ?? 'cash';
+
+      DateTime date =
+          DateTime.tryParse(existing?['expense_date']?.toString() ?? '') ??
+          DateTime.now();
+
+      final categories = [
+        'كهرباء',
+        'إنترنت',
+        'رواتب',
+        'صيانة',
+        'إيجار',
+        'نقل ومواصلات',
+        'اتصالات',
+        'مصاريف أخرى',
+      ];
+
+      if (!categories.contains(category)) {
+        categories.add(category);
+      }
+
+      final saved = await showDialog<bool>(
+        context: context,
+        builder: (dialogContext) => StatefulBuilder(
+          builder: (dialogContext, setDialogState) {
+            return AlertDialog(
+              title: Text(editing ? 'تعديل مصروف' : 'إضافة مصروف جديد'),
+              content: SizedBox(
+                width: 430,
+                child: SingleChildScrollView(
+                  child: Column(
+                    mainAxisSize: MainAxisSize.min,
+                    children: [
+                      DropdownButtonFormField<String>(
+                        initialValue: category,
+                        decoration: const InputDecoration(
+                          labelText: 'تصنيف المصروف',
+                        ),
+                        items: categories
+                            .map(
+                              (value) => DropdownMenuItem(
+                                value: value,
+                                child: Text(value),
+                              ),
+                            )
+                            .toList(),
+                        onChanged: (value) {
+                          if (value != null) {
+                            setDialogState(() => category = value);
+                          }
+                        },
+                      ),
+                      const SizedBox(height: 12),
+                      TextField(
+                        controller: description,
+                        decoration: const InputDecoration(
+                          labelText: 'وصف المصروف',
+                        ),
+                      ),
+                      const SizedBox(height: 12),
+                      TextField(
+                        controller: amount,
+                        keyboardType: const TextInputType.numberWithOptions(
+                          decimal: true,
+                        ),
+                        decoration: const InputDecoration(labelText: 'المبلغ'),
+                      ),
+                      const SizedBox(height: 12),
+                      DropdownButtonFormField<String>(
+                        initialValue: currency,
+                        decoration: const InputDecoration(labelText: 'العملة'),
+                        items: const [
+                          DropdownMenuItem(value: 'USD', child: Text('USD')),
+                          DropdownMenuItem(value: 'SYP', child: Text('SYP')),
+                        ],
+                        onChanged: (value) {
+                          if (value != null) {
+                            setDialogState(() => currency = value);
+                          }
+                        },
+                      ),
+                      const SizedBox(height: 12),
+                      DropdownButtonFormField<String>(
+                        initialValue: paymentMethod,
+                        decoration: const InputDecoration(
+                          labelText: 'طريقة الدفع',
+                        ),
+                        items: const [
+                          DropdownMenuItem(value: 'cash', child: Text('نقدي')),
+                          DropdownMenuItem(
+                            value: 'transfer',
+                            child: Text('تحويل'),
+                          ),
+                        ],
+                        onChanged: (value) {
+                          if (value != null) {
+                            setDialogState(() => paymentMethod = value);
+                          }
+                        },
+                      ),
+                      const SizedBox(height: 12),
+                      ListTile(
+                        contentPadding: EdgeInsets.zero,
+                        title: const Text('تاريخ المصروف'),
+                        subtitle: Text(
+                          '${date.year}-${date.month.toString().padLeft(2, '0')}-${date.day.toString().padLeft(2, '0')}',
+                        ),
+                        trailing: const Icon(Icons.calendar_month),
+                        onTap: () async {
+                          final picked = await showDatePicker(
+                            context: dialogContext,
+                            initialDate: date,
+                            firstDate: DateTime(2020),
+                            lastDate: DateTime(2100),
+                          );
+                          if (picked != null) {
+                            setDialogState(() => date = picked);
+                          }
+                        },
+                      ),
+                      TextField(
+                        controller: notes,
+                        maxLines: 2,
+                        decoration: const InputDecoration(labelText: 'ملاحظات'),
+                      ),
+                    ],
+                  ),
+                ),
+              ),
+              actions: [
+                TextButton(
+                  onPressed: () => Navigator.pop(dialogContext, false),
+                  child: const Text('إلغاء'),
+                ),
+                FilledButton(
+                  onPressed: () async {
+                    final value = double.tryParse(
+                      amount.text.trim().replaceAll(',', '.'),
+                    );
+
+                    if (value == null || !value.isFinite || value <= 0) {
+                      ScaffoldMessenger.of(dialogContext).showSnackBar(
+                        const SnackBar(
+                          content: Text('أدخل مبلغًا صحيحًا أكبر من صفر'),
+                        ),
+                      );
+                      return;
+                    }
+
+                    final dateText =
+                        '${date.year}-${date.month.toString().padLeft(2, '0')}-${date.day.toString().padLeft(2, '0')}';
+
+                    final data = <String, dynamic>{
+                      'category': category,
+                      'description': description.text.trim(),
+                      'amount': value,
+                      'currency': currency,
+                      'payment_method': paymentMethod,
+                      'expense_date': dateText,
+                      'notes': notes.text.trim(),
+                      'updated_at': DateTime.now().toUtc().toIso8601String(),
+                    };
+
+                    try {
+                      if (editing) {
+                        await db
+                            .from('accounting_expenses')
+                            .update(data)
+                            .eq('id', existing['id'])
+                            .eq('created_by', userId);
+                      } else {
+                        data['created_by'] = userId;
+                        await db.from('accounting_expenses').insert(data);
+                      }
+
+                      if (dialogContext.mounted) {
+                        Navigator.pop(dialogContext, true);
+                      }
+                    } catch (e) {
+                      if (dialogContext.mounted) {
+                        ScaffoldMessenger.of(dialogContext).showSnackBar(
+                          SnackBar(content: Text('فشل الحفظ: $e')),
+                        );
+                      }
+                    }
+                  },
+                  child: const Text('حفظ'),
+                ),
+              ],
+            );
+          },
+        ),
+      );
+
+      description.dispose();
+      amount.dispose();
+      notes.dispose();
+
+      if (saved == true && mounted) {
+        setState(() {});
+      }
+    }
+
+    Future<void> deleteExpense(Map<String, dynamic> expense) async {
+      final confirmed = await showDialog<bool>(
+        context: context,
+        builder: (dialogContext) => AlertDialog(
+          title: const Text('حذف المصروف'),
+          content: const Text('هل تريد حذف هذا المصروف نهائيًا؟'),
+          actions: [
+            TextButton(
+              onPressed: () => Navigator.pop(dialogContext, false),
+              child: const Text('إلغاء'),
+            ),
+            FilledButton(
+              onPressed: () => Navigator.pop(dialogContext, true),
+              child: const Text('حذف'),
+            ),
+          ],
+        ),
+      );
+
+      if (confirmed != true) return;
+
+      try {
+        await db
+            .from('accounting_expenses')
+            .delete()
+            .eq('id', expense['id'])
+            .eq('created_by', userId);
+
+        if (mounted) setState(() {});
+      } catch (e) {
+        if (mounted) {
+          ScaffoldMessenger.of(context)
+              .showSnackBar(SnackBar(content: Text('فشل الحذف: $e')));
+        }
+      }
+    }
+
+    return FutureBuilder<List<Map<String, dynamic>>>(
+      future: loadExpenses(),
+      builder: (context, snapshot) {
+        if (snapshot.hasError) {
+          return Center(
+            child: Text('خطأ في تحميل المصروفات: ${snapshot.error}'),
+          );
+        }
+
+        if (!snapshot.hasData) {
+          return const Center(child: CircularProgressIndicator());
+        }
+
+        final expenses = snapshot.data!;
+        double usd = 0;
+        double syp = 0;
+
+        for (final expense in expenses) {
+          final value = (expense['amount'] as num?)?.toDouble() ?? 0;
+          if (expense['currency'] == 'USD') {
+            usd += value;
+          } else if (expense['currency'] == 'SYP') {
+            syp += value;
+          }
+        }
+
+        return ListView(
+          padding: const EdgeInsets.all(14),
+          children: [
+            Row(
+              children: [
+                IconButton(
+                  onPressed: () {
+                    setState(() => selectedIndex = 14);
+                  },
+                  icon: const Icon(Icons.arrow_back_rounded),
+                ),
+                Expanded(
+                  child: Text(
+                    ar ? 'المصروفات التشغيلية' : 'Operating Expenses',
+                    style: const TextStyle(
+                      fontSize: 22,
+                      fontWeight: FontWeight.bold,
+                    ),
+                  ),
+                ),
+                IconButton(
+                  tooltip: 'تحديث',
+                  onPressed: () => setState(() {}),
+                  icon: const Icon(Icons.refresh_rounded),
+                ),
+              ],
+            ),
+            const SizedBox(height: 12),
+            FilledButton.icon(
+              onPressed: () => openExpenseDialog(),
+              icon: const Icon(Icons.add_rounded),
+              label: const Text('إضافة مصروف'),
+            ),
+            const SizedBox(height: 12),
+            Card(
+              child: Padding(
+                padding: const EdgeInsets.all(16),
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    const Text(
+                      'إجمالي المصروفات المسجلة',
+                      style: TextStyle(fontWeight: FontWeight.bold),
+                    ),
+                    const SizedBox(height: 8),
+                    Text('${usd.toStringAsFixed(2)} USD'),
+                    Text('${syp.toStringAsFixed(0)} SYP'),
+                  ],
+                ),
+              ),
+            ),
+            const SizedBox(height: 12),
+            if (expenses.isEmpty)
+              const Center(child: Text('لا توجد مصروفات مسجلة'))
+            else
+              ...expenses.map(
+                (expense) => Card(
+                  child: ListTile(
+                    leading: const CircleAvatar(
+                      child: Icon(Icons.receipt_long_rounded),
+                    ),
+                    title: Text(expense['category']?.toString() ?? ''),
+                    subtitle: Text(
+                      '${expense['description'] ?? ''}\n'
+                      '${expense['expense_date'] ?? ''}\n'
+                      '${expense['payment_method'] == 'cash' ? 'نقدي' : 'تحويل'}',
+                    ),
+                    isThreeLine: true,
+                    trailing: Wrap(
+                      crossAxisAlignment: WrapCrossAlignment.center,
+                      spacing: 4,
+                      children: [
+                        Text('${expense['amount']} ${expense['currency']}'),
+                        IconButton(
+                          tooltip: 'تعديل',
+                          onPressed: () => openExpenseDialog(existing: expense),
+                          icon: const Icon(Icons.edit_rounded),
+                        ),
+                        IconButton(
+                          tooltip: 'حذف',
+                          onPressed: () => deleteExpense(expense),
+                          icon: const Icon(Icons.delete_outline_rounded),
+                        ),
+                      ],
+                    ),
+                  ),
+                ),
+              ),
+          ],
+        );
+      },
+    );
+  }
+
+  final ScrollController cashboxHorizontalController = ScrollController();
+
+  Widget buildAccountingCashbox() {
+    final db = Supabase.instance.client;
+    final userId = widget.currentUser.id;
+
+    Future<List<Map<String, dynamic>>> loadCashbox() async {
+      final results = await Future.wait([
+        db
+            .from('accounting_transactions')
+            .select(
+              'id,transaction_date,transaction_type,amount,currency,'
+              'payment_method,party_name,notes,customer_id,supplier_id',
+            )
+            .eq('created_by', userId)
+            .order('transaction_date', ascending: false),
+        db
+            .from('accounting_expenses')
+            .select(
+              'id,expense_date,description,amount,currency,payment_method',
+            )
+            .eq('created_by', userId)
+            .order('expense_date', ascending: false),
+        db
+            .from('accounting_customers')
+            .select('id,name')
+            .eq('created_by', userId),
+        db
+            .from('accounting_suppliers')
+            .select('id,name')
+            .eq('created_by', userId),
+      ]);
+
+      final customerNames = <String, String>{
+        for (final row in results[2])
+          if (row['id'] != null)
+            row['id'].toString(): row['name']?.toString() ?? '',
+      };
+
+      final supplierNames = <String, String>{
+        for (final row in results[3])
+          if (row['id'] != null)
+            row['id'].toString(): row['name']?.toString() ?? '',
+      };
+
+      final movements = <Map<String, dynamic>>[];
+
+      for (final raw in results[0]) {
+        final row = Map<String, dynamic>.from(raw);
+        final method = (row['payment_method'] ?? 'cash')
+            .toString()
+            .toLowerCase();
+
+        if (method != 'cash') continue;
+
+        final type = row['transaction_type']?.toString() ?? '';
+
+        final incoming =
+            type == 'customer_receipt' || type == 'supplier_receipt';
+
+        final outgoing =
+            type == 'supplier_payment' || type == 'customer_payment';
+
+        if (!incoming && !outgoing) continue;
+
+        final customerId = row['customer_id']?.toString();
+        final supplierId = row['supplier_id']?.toString();
+        final partyName = row['party_name']?.toString().trim() ?? '';
+
+        String party = 'غير محدد';
+
+        if (customerId != null &&
+            customerNames[customerId]?.isNotEmpty == true) {
+          party = customerNames[customerId]!;
+        } else if (supplierId != null &&
+            supplierNames[supplierId]?.isNotEmpty == true) {
+          party = supplierNames[supplierId]!;
+        } else if (partyName.isNotEmpty) {
+          party = partyName;
+        }
+
+        movements.add({
+          'date': row['transaction_date'],
+          'title': incoming ? 'سند قبض / مقبوضات' : 'سند صرف / مدفوعات',
+          'party': party,
+          'details': row['notes'] ?? '',
+          'amount': (row['amount'] as num?)?.toDouble() ?? 0.0,
+          'currency': row['currency'],
+          'incoming': incoming,
+        });
+      }
+
+      for (final raw in results[1]) {
+        final row = Map<String, dynamic>.from(raw);
+        final method = (row['payment_method'] ?? '').toString().toLowerCase();
+
+        if (method != 'cash') continue;
+
+        movements.add({
+          'date': row['expense_date'],
+          'title': 'مصروف تشغيلي',
+          'party': '—',
+          'details': row['description'] ?? '',
+          'amount': (row['amount'] as num?)?.toDouble() ?? 0.0,
+          'currency': row['currency'],
+          'incoming': false,
+        });
+      }
+
+      movements.sort(
+        (a, b) => (b['date'] ?? '').toString().compareTo(
+          (a['date'] ?? '').toString(),
+        ),
+      );
+
+      return movements;
+    }
+
+    DateTime? cashboxFromDate;
+    DateTime? cashboxToDate;
+    DateTime? appliedFromDate;
+    DateTime? appliedToDate;
+
+    String cashboxDateLabel(DateTime? date) {
+      if (date == null) return 'اختر التاريخ';
+      String two(int n) => n.toString().padLeft(2, '0');
+      return '${two(date.day)}/${two(date.month)}/${date.year}';
+    }
+
+    return StatefulBuilder(
+      builder: (cashboxContext, setCashboxState) {
+        return Scaffold(
+          appBar: AppBar(title: const Text('الصندوق وحركة النقد')),
+          body: FutureBuilder<List<Map<String, dynamic>>>(
+            future: loadCashbox(),
+            builder: (context, snapshot) {
+              if (snapshot.hasError) {
+                return Center(
+                  child: SelectableText(
+                    'خطأ في تحميل الصندوق:\n${snapshot.error}',
+                  ),
+                );
+              }
+
+              if (!snapshot.hasData) {
+                return const Center(child: CircularProgressIndicator());
+              }
+
+              final movements = snapshot.data!.where((item) {
+                if (appliedFromDate == null && appliedToDate == null) {
+                  return true;
+                }
+
+                final parsed = DateTime.tryParse(
+                  item['date']?.toString() ?? '',
+                );
+                if (parsed == null) return false;
+
+                final date = parsed.toLocal();
+                final day = DateTime(date.year, date.month, date.day);
+
+                if (appliedFromDate != null && day.isBefore(appliedFromDate!)) {
+                  return false;
+                }
+
+                if (appliedToDate != null && day.isAfter(appliedToDate!)) {
+                  return false;
+                }
+
+                return true;
+              }).toList();
+
+              double incomingUsd = 0;
+              double outgoingUsd = 0;
+              double incomingSyp = 0;
+              double outgoingSyp = 0;
+
+              for (final item in movements) {
+                final amount = (item['amount'] as num).toDouble();
+                final incoming = item['incoming'] == true;
+                final currency = item['currency']?.toString();
+
+                if (currency == 'USD') {
+                  if (incoming) {
+                    incomingUsd += amount;
+                  } else {
+                    outgoingUsd += amount;
+                  }
+                } else if (currency == 'SYP') {
+                  if (incoming) {
+                    incomingSyp += amount;
+                  } else {
+                    outgoingSyp += amount;
+                  }
+                }
+              }
+
+              Widget balanceBox(String title, double amount, String currency) {
+                return Container(
+                  padding: const EdgeInsets.symmetric(
+                    horizontal: 12,
+                    vertical: 9,
+                  ),
+                  decoration: BoxDecoration(
+                    color: Theme.of(context).colorScheme.surfaceContainerLow,
+                    borderRadius: BorderRadius.circular(10),
+                    border: Border.all(color: Theme.of(context).dividerColor),
+                  ),
+                  child: Column(
+                    crossAxisAlignment: CrossAxisAlignment.start,
+                    children: [
+                      Text(title, style: const TextStyle(fontSize: 12)),
+                      const SizedBox(height: 3),
+                      Text(
+                        '${amount.toStringAsFixed(2)} $currency',
+                        style: TextStyle(
+                          fontSize: 17,
+                          fontWeight: FontWeight.bold,
+                          color: amount < 0 ? Colors.red : Colors.green,
+                        ),
+                      ),
+                    ],
+                  ),
+                );
+              }
+
+              Widget amountText(double amount, Color color) {
+                return Text(
+                  amount == 0 ? '—' : amount.toStringAsFixed(2),
+                  style: TextStyle(
+                    color: color,
+                    fontWeight: FontWeight.w600,
+                    fontSize: 12,
+                  ),
+                );
+              }
+
+              String shortDate(dynamic value) {
+                final date = DateTime.tryParse(value?.toString() ?? '')
+                    ?.toLocal();
+
+                if (date == null) {
+                  return value?.toString() ?? '';
+                }
+
+                String two(int n) => n.toString().padLeft(2, '0');
+
+                return '${two(date.day)}/${two(date.month)}/${date.year}';
+              }
+
+              return RefreshIndicator(
+                onRefresh: () async {
+                  setState(() {});
+                },
+                child: ListView(
+                  padding: const EdgeInsets.all(8),
+                  children: [
+                    Wrap(
+                      spacing: 8,
+                      runSpacing: 8,
+                      crossAxisAlignment: WrapCrossAlignment.center,
+                      children: [
+                        OutlinedButton.icon(
+                          icon: const Icon(Icons.date_range, size: 17),
+                          label: Text(
+                            'من تاريخ: ${cashboxDateLabel(cashboxFromDate)}',
+                          ),
+                          onPressed: () async {
+                            final picked = await showDatePicker(
+                              context: cashboxContext,
+                              initialDate: cashboxFromDate ?? DateTime.now(),
+                              firstDate: DateTime(2000),
+                              lastDate: DateTime(2100),
+                            );
+                            if (picked != null) {
+                              setCashboxState(() {
+                                cashboxFromDate = picked;
+                              });
+                            }
+                          },
+                        ),
+                        OutlinedButton.icon(
+                          icon: const Icon(Icons.event, size: 17),
+                          label: Text(
+                            'إلى تاريخ: ${cashboxDateLabel(cashboxToDate)}',
+                          ),
+                          onPressed: () async {
+                            final picked = await showDatePicker(
+                              context: cashboxContext,
+                              initialDate:
+                                  cashboxToDate ??
+                                  cashboxFromDate ??
+                                  DateTime.now(),
+                              firstDate: DateTime(2000),
+                              lastDate: DateTime(2100),
+                            );
+                            if (picked != null) {
+                              setCashboxState(() {
+                                cashboxToDate = picked;
+                              });
+                            }
+                          },
+                        ),
+                        FilledButton.icon(
+                          icon: const Icon(Icons.filter_alt, size: 17),
+                          label: const Text('تطبيق'),
+                          onPressed: () {
+                            if (cashboxFromDate != null &&
+                                cashboxToDate != null &&
+                                cashboxFromDate!.isAfter(cashboxToDate!)) {
+                              ScaffoldMessenger.of(cashboxContext).showSnackBar(
+                                const SnackBar(
+                                  content: Text(
+                                    'تاريخ البداية يجب ألا يتجاوز تاريخ النهاية',
+                                  ),
+                                ),
+                              );
+                              return;
+                            }
+
+                            setCashboxState(() {
+                              appliedFromDate = cashboxFromDate;
+                              appliedToDate = cashboxToDate;
+                            });
+                          },
+                        ),
+                        OutlinedButton.icon(
+                          icon: const Icon(Icons.clear, size: 17),
+                          label: const Text('مسح الفلترة'),
+                          onPressed: () {
+                            setCashboxState(() {
+                              cashboxFromDate = null;
+                              cashboxToDate = null;
+                              appliedFromDate = null;
+                              appliedToDate = null;
+                            });
+                          },
+                        ),
+                      ],
+                    ),
+                    const SizedBox(height: 8),
+                    Row(
+                      children: [
+                        Expanded(
+                          child: balanceBox(
+                            'صافي الدولار',
+                            incomingUsd - outgoingUsd,
+                            'USD',
+                          ),
+                        ),
+                        const SizedBox(width: 6),
+                        Expanded(
+                          child: balanceBox(
+                            'صافي الليرة',
+                            incomingSyp - outgoingSyp,
+                            'SYP',
+                          ),
+                        ),
+                      ],
+                    ),
+                    const SizedBox(height: 7),
+                    Container(
+                      padding: const EdgeInsets.all(9),
+                      decoration: BoxDecoration(
+                        color: Theme.of(context)
+                            .colorScheme
+                            .surfaceContainerLow,
+                        borderRadius: BorderRadius.circular(9),
+                      ),
+                      child: Column(
+                        crossAxisAlignment: CrossAxisAlignment.start,
+                        children: [
+                          Text(
+                            'USD   قبض: ${incomingUsd.toStringAsFixed(2)}'
+                            '   |   صرف: ${outgoingUsd.toStringAsFixed(2)}',
+                            style: const TextStyle(fontSize: 12),
+                          ),
+                          const SizedBox(height: 3),
+                          Text(
+                            'SYP   قبض: ${incomingSyp.toStringAsFixed(2)}'
+                            '   |   صرف: ${outgoingSyp.toStringAsFixed(2)}',
+                            style: const TextStyle(fontSize: 12),
+                          ),
+                        ],
+                      ),
+                    ),
+                    const SizedBox(height: 10),
+                    Row(
+                      children: [
+                        const Expanded(
+                          child: Text(
+                            'سجل حركة الصندوق',
+                            style: TextStyle(
+                              fontSize: 15,
+                              fontWeight: FontWeight.bold,
+                            ),
+                          ),
+                        ),
+                        Text(
+                          '${movements.length} حركة',
+                          style: const TextStyle(fontSize: 12),
+                        ),
+                      ],
+                    ),
+                    const SizedBox(height: 5),
+                    if (movements.isEmpty)
+                      const Padding(
+                        padding: EdgeInsets.all(20),
+                        child: Center(
+                          child: Text('لا توجد حركات في هذه الفترة'),
+                        ),
+                      )
+                    else
+                      LayoutBuilder(
+                        builder: (context, constraints) {
+                          return Scrollbar(
+                            thumbVisibility: true,
+                            controller: cashboxHorizontalController,
+                            scrollbarOrientation: ScrollbarOrientation.bottom,
+                            child: SingleChildScrollView(
+                              controller: cashboxHorizontalController,
+                              scrollDirection: Axis.horizontal,
+                              child: ConstrainedBox(
+                                constraints: BoxConstraints(
+                                  minWidth: constraints.maxWidth,
+                                ),
+                                child: DataTable(
+                                  headingRowHeight: 36,
+                                  dataRowMinHeight: 36,
+                                  dataRowMaxHeight: 44,
+                                  horizontalMargin: 8,
+                                  columnSpacing: 14,
+                                  columns: const [
+                                    DataColumn(label: Text('التاريخ')),
+                                    DataColumn(label: Text('العملة')),
+                                    DataColumn(label: Text('البيان')),
+                                    DataColumn(label: Text('العميل / المورد')),
+                                    DataColumn(label: Text('التفاصيل')),
+                                    DataColumn(
+                                      numeric: true,
+                                      label: Text('الوارد'),
+                                    ),
+                                    DataColumn(
+                                      numeric: true,
+                                      label: Text('الصادر'),
+                                    ),
+                                  ],
+                                  rows: movements.map((item) {
+                                    final incoming = item['incoming'] == true;
+                                    final amount = (item['amount'] as num)
+                                        .toDouble();
+
+                                    return DataRow(
+                                      cells: [
+                                        DataCell(
+                                          Text(
+                                            shortDate(item['date']),
+                                            style: const TextStyle(
+                                              fontSize: 12,
+                                            ),
+                                          ),
+                                        ),
+                                        DataCell(
+                                          Text(
+                                            item['currency']?.toString() ?? '',
+                                            style: const TextStyle(
+                                              fontSize: 12,
+                                            ),
+                                          ),
+                                        ),
+                                        DataCell(
+                                          Text(
+                                            item['title']?.toString() ?? '',
+                                            style: const TextStyle(
+                                              fontSize: 12,
+                                            ),
+                                          ),
+                                        ),
+                                        DataCell(
+                                          ConstrainedBox(
+                                            constraints: const BoxConstraints(
+                                              maxWidth: 160,
+                                            ),
+                                            child: Text(
+                                              item['party']?.toString() ??
+                                                  'غير محدد',
+                                              maxLines: 1,
+                                              overflow: TextOverflow.ellipsis,
+                                              style: const TextStyle(
+                                                fontSize: 12,
+                                              ),
+                                            ),
+                                          ),
+                                        ),
+                                        DataCell(
+                                          ConstrainedBox(
+                                            constraints: const BoxConstraints(
+                                              maxWidth: 180,
+                                            ),
+                                            child: Text(
+                                              item['details']?.toString() ?? '',
+                                              maxLines: 1,
+                                              overflow: TextOverflow.ellipsis,
+                                              style: const TextStyle(
+                                                fontSize: 12,
+                                              ),
+                                            ),
+                                          ),
+                                        ),
+                                        DataCell(
+                                          amountText(
+                                            incoming ? amount : 0,
+                                            Colors.green,
+                                          ),
+                                        ),
+                                        DataCell(
+                                          amountText(
+                                            incoming ? 0 : amount,
+                                            Colors.red,
+                                          ),
+                                        ),
+                                      ],
+                                    );
+                                  }).toList(),
+                                ),
+                              ),
+                            ),
+                          );
+                        },
+                      ),
+                    const SizedBox(height: 8),
+                    const Text(
+                      'الأرصدة تمثل صافي الحركة النقدية '
+                      'دون رصيد افتتاحي.',
+                      style: TextStyle(fontSize: 11, color: Colors.grey),
+                    ),
+                  ],
+                ),
+              );
+            },
+          ),
+        );
+      },
+    );
+  }
 
   Widget buildAccountingDashboard() {
     final isArabic = widget.currentUser.language == 'ar';
@@ -12602,6 +18191,30 @@ class _DashboardPageState extends State<DashboardPage> {
                               ar: 'سندات القبض والصرف',
                               en: 'Vouchers',
                             ),
+                            (
+                              index: 21,
+                              icon: Icons.account_balance_wallet_rounded,
+                              ar: 'كشف الحساب',
+                              en: 'Account Statement',
+                            ),
+                            (
+                              index: 23,
+                              icon: Icons.assessment_rounded,
+                              ar: 'التقارير المحاسبية',
+                              en: 'Accounting Reports',
+                            ),
+                            (
+                              index: 24,
+                              icon: Icons.receipt_rounded,
+                              ar: 'المصروفات التشغيلية',
+                              en: 'Operating Expenses',
+                            ),
+                            (
+                              index: 25,
+                              icon: Icons.account_balance_wallet_rounded,
+                              ar: 'الصندوق وحركة النقد',
+                              en: 'Cashbox & Cash Movements',
+                            ),
                           ];
 
                       return SafeArea(
@@ -12645,6 +18258,11 @@ class _DashboardPageState extends State<DashboardPage> {
                                       await loadAccountingSales();
                                     case 19:
                                       await loadAccountingPurchases();
+                                    case 21:
+                                      await Future.wait([
+                                        loadAccountingCustomers(),
+                                        loadAccountingSuppliers(),
+                                      ]);
                                   }
                                 },
                               ),
@@ -16133,6 +21751,48 @@ class _DashboardPageState extends State<DashboardPage> {
       label: Text(isArabic ? 'فاتورة جديدة' : 'New Invoice'),
     );
 
+    final filteredPurchases = accountingPurchases
+        .where((purchase) {
+          final query = accountingPurchasesSearch.trim().toLowerCase();
+          if (query.isEmpty) return true;
+
+          final number =
+              purchase['invoice_number']?.toString().toLowerCase() ?? '';
+          final party = (purchase['_supplier_name']?.toString() ?? '')
+              .toLowerCase();
+
+          return number.contains(query) || party.contains(query);
+        })
+        .where((purchase) {
+          final raw = purchase['invoice_date']?.toString();
+          final date = raw == null ? null : DateTime.tryParse(raw);
+          if (date == null)
+            return accountingPurchasesFromDate == null &&
+                accountingPurchasesToDate == null;
+          final day = DateTime(date.year, date.month, date.day);
+          if (accountingPurchasesFromDate != null &&
+              day.isBefore(accountingPurchasesFromDate!))
+            return false;
+          if (accountingPurchasesToDate != null &&
+              day.isAfter(accountingPurchasesToDate!))
+            return false;
+          return true;
+        })
+        .toList();
+
+    filteredPurchases.sort((a, b) {
+      if (accountingPurchasesSort == 'amount_desc') {
+        final av = (a['total_usd'] as num?)?.toDouble() ?? 0;
+        final bv = (b['total_usd'] as num?)?.toDouble() ?? 0;
+        return bv.compareTo(av);
+      }
+      final av = a['invoice_date']?.toString() ?? '';
+      final bv = b['invoice_date']?.toString() ?? '';
+      return accountingPurchasesSort == 'oldest'
+          ? av.compareTo(bv)
+          : bv.compareTo(av);
+    });
+
     return Padding(
       padding: EdgeInsets.all(isMobile ? 12 : 20),
       child: Column(
@@ -16170,6 +21830,91 @@ class _DashboardPageState extends State<DashboardPage> {
             SizedBox(width: double.infinity, child: newPurchaseButton),
           ],
 
+          TextField(
+            decoration: const InputDecoration(
+              prefixIcon: Icon(Icons.search),
+              labelText: 'ابحث برقم الفاتورة أو اسم المورد',
+              border: OutlineInputBorder(),
+              isDense: true,
+            ),
+            onChanged: (value) {
+              setState(() => accountingPurchasesSearch = value);
+            },
+          ),
+          const SizedBox(height: 12),
+          Wrap(
+            spacing: 8,
+            runSpacing: 8,
+            children: [
+              OutlinedButton.icon(
+                icon: const Icon(Icons.event),
+                label: Text(
+                  accountingPurchasesFromDate == null
+                      ? 'من تاريخ'
+                      : 'من: ${accountingPurchasesFromDate!.year}/${accountingPurchasesFromDate!.month}/${accountingPurchasesFromDate!.day}',
+                ),
+                onPressed: () async {
+                  final date = await showDatePicker(
+                    context: context,
+                    initialDate: accountingPurchasesFromDate ?? DateTime.now(),
+                    firstDate: DateTime(2000),
+                    lastDate: accountingPurchasesToDate ?? DateTime(2100),
+                  );
+                  if (date == null || !mounted) return;
+                  setState(() => accountingPurchasesFromDate = date);
+                },
+              ),
+              OutlinedButton.icon(
+                icon: const Icon(Icons.event),
+                label: Text(
+                  accountingPurchasesToDate == null
+                      ? 'إلى تاريخ'
+                      : 'إلى: ${accountingPurchasesToDate!.year}/${accountingPurchasesToDate!.month}/${accountingPurchasesToDate!.day}',
+                ),
+                onPressed: () async {
+                  final date = await showDatePicker(
+                    context: context,
+                    initialDate: accountingPurchasesToDate ?? DateTime.now(),
+                    firstDate: accountingPurchasesFromDate ?? DateTime(2000),
+                    lastDate: DateTime(2100),
+                  );
+                  if (date == null || !mounted) return;
+                  setState(() => accountingPurchasesToDate = date);
+                },
+              ),
+              DropdownButton<String>(
+                value: accountingPurchasesSort,
+                items: const [
+                  DropdownMenuItem(
+                    value: 'newest',
+                    child: Text('الأحدث أولًا'),
+                  ),
+                  DropdownMenuItem(
+                    value: 'oldest',
+                    child: Text('الأقدم أولًا'),
+                  ),
+                  DropdownMenuItem(
+                    value: 'amount_desc',
+                    child: Text('الأعلى مبلغًا USD'),
+                  ),
+                ],
+                onChanged: (value) {
+                  if (value != null)
+                    setState(() => accountingPurchasesSort = value);
+                },
+              ),
+              IconButton(
+                tooltip: 'إعادة ضبط الفلاتر',
+                icon: const Icon(Icons.restart_alt),
+                onPressed: () => setState(() {
+                  accountingPurchasesFromDate = null;
+                  accountingPurchasesToDate = null;
+                  accountingPurchasesSort = 'newest';
+                }),
+              ),
+            ],
+          ),
+          const SizedBox(height: 12),
           const SizedBox(height: 20),
 
           if (!isMobile)
@@ -16208,10 +21953,10 @@ class _DashboardPageState extends State<DashboardPage> {
                     ),
                   )
                 : ListView.separated(
-                    itemCount: accountingPurchases.length,
+                    itemCount: filteredPurchases.length,
                     separatorBuilder: (_, _) => const Divider(height: 1),
                     itemBuilder: (context, index) {
-                      final purchase = accountingPurchases[index];
+                      final purchase = filteredPurchases[index];
 
                       final number =
                           purchase['invoice_number']?.toString() ?? '-';
@@ -39180,6 +44925,1135 @@ class _DashboardPageState extends State<DashboardPage> {
       ScaffoldMessenger.of(context)
           .showSnackBar(SnackBar(content: Text('حدث خطأ أثناء الحذف: $e')));
     }
+  }
+
+  Future<void> openMikrotikNetworkDialog({
+    Map<String, dynamic>? existing,
+  }) async {
+    final supabase = Supabase.instance.client;
+
+    final nameController = TextEditingController(
+      text: existing?['network_name']?.toString() ?? '',
+    );
+    final hostController = TextEditingController(
+      text: existing?['mikrotik_host']?.toString() ?? '',
+    );
+    final usernameController = TextEditingController(
+      text: existing?['mikrotik_username']?.toString() ?? '',
+    );
+    final portController = TextEditingController(
+      text: existing?['mikrotik_port']?.toString() ?? '8728',
+    );
+
+    String? selectedDeviceId = existing?['device_id']?.toString();
+    String? selectedUserId = existing?['user_id']?.toString();
+    bool saving = false;
+
+    try {
+      final deviceRows = await supabase
+          .from('network_devices')
+          .select('id,name,user_id')
+          .order('name');
+
+      if (!mounted) return;
+
+      final availableDevices = List<Map<String, dynamic>>.from(deviceRows);
+
+      if (selectedDeviceId != null &&
+          !availableDevices.any(
+            (d) => d['id']?.toString() == selectedDeviceId,
+          )) {
+        selectedDeviceId = null;
+      }
+
+      await showDialog<void>(
+        context: context,
+        builder: (dialogContext) {
+          return StatefulBuilder(
+            builder: (dialogContext, setDialogState) {
+              return AlertDialog(
+                title: Text(
+                  existing == null
+                      ? 'إضافة شبكة MikroTik'
+                      : 'تعديل شبكة MikroTik',
+                ),
+                content: SizedBox(
+                  width: 460,
+                  child: SingleChildScrollView(
+                    child: Column(
+                      mainAxisSize: MainAxisSize.min,
+                      children: [
+                        TextField(
+                          controller: nameController,
+                          decoration: const InputDecoration(
+                            labelText: 'اسم الشبكة',
+                            prefixIcon: Icon(Icons.hub),
+                          ),
+                        ),
+                        const SizedBox(height: 12),
+                        TextField(
+                          controller: hostController,
+                          decoration: const InputDecoration(
+                            labelText: 'IP أو Domain',
+                            prefixIcon: Icon(Icons.dns),
+                          ),
+                        ),
+                        const SizedBox(height: 12),
+                        TextField(
+                          controller: usernameController,
+                          decoration: const InputDecoration(
+                            labelText: 'اسم مستخدم MikroTik',
+                            prefixIcon: Icon(Icons.person),
+                          ),
+                        ),
+                        const SizedBox(height: 12),
+                        TextField(
+                          controller: portController,
+                          keyboardType: TextInputType.number,
+                          decoration: const InputDecoration(
+                            labelText: 'منفذ API',
+                            prefixIcon: Icon(Icons.settings_ethernet),
+                          ),
+                        ),
+                        const SizedBox(height: 12),
+                        DropdownButtonFormField<String>(
+                          value: selectedDeviceId,
+                          isExpanded: true,
+                          decoration: const InputDecoration(
+                            labelText: 'جهاز الشبكة المرتبط',
+                            prefixIcon: Icon(Icons.router),
+                          ),
+                          items: availableDevices.map((device) {
+                            return DropdownMenuItem<String>(
+                              value: device['id'].toString(),
+                              child: Text(
+                                device['name']?.toString() ?? 'جهاز',
+                                overflow: TextOverflow.ellipsis,
+                              ),
+                            );
+                          }).toList(),
+                          onChanged: saving
+                              ? null
+                              : (value) {
+                                  setDialogState(() {
+                                    selectedDeviceId = value;
+                                    final device = availableDevices.firstWhere(
+                                      (d) => d['id'].toString() == value,
+                                    );
+                                    selectedUserId = device['user_id']
+                                        ?.toString();
+                                  });
+                                },
+                        ),
+                        const SizedBox(height: 12),
+                        const Text(
+                          'حفظ بيانات الشبكة لا يعني اختبار الاتصال. '
+                          'سيتم تفعيل الاتصال الآمن لاحقًا.',
+                          style: TextStyle(fontSize: 12),
+                        ),
+                      ],
+                    ),
+                  ),
+                ),
+                actions: [
+                  TextButton(
+                    onPressed: saving
+                        ? null
+                        : () => Navigator.pop(dialogContext),
+                    child: const Text('إلغاء'),
+                  ),
+                  FilledButton.icon(
+                    onPressed: saving
+                        ? null
+                        : () async {
+                            final name = nameController.text.trim();
+                            final host = hostController.text.trim();
+                            final username = usernameController.text.trim();
+                            final port = int.tryParse(
+                              portController.text.trim(),
+                            );
+
+                            if (name.isEmpty ||
+                                host.isEmpty ||
+                                username.isEmpty ||
+                                port == null ||
+                                port < 1 ||
+                                port > 65535 ||
+                                selectedDeviceId == null) {
+                              ScaffoldMessenger.of(context).showSnackBar(
+                                const SnackBar(
+                                  content: Text(
+                                    'أكمل جميع الحقول واختر جهازًا ومنفذًا صحيحًا',
+                                  ),
+                                ),
+                              );
+                              return;
+                            }
+
+                            final device = availableDevices.firstWhere(
+                              (d) => d['id']?.toString() == selectedDeviceId,
+                            );
+
+                            selectedUserId = device['user_id']?.toString();
+
+                            // حساب المدير هو مالك الاتصال الإداري
+                            // إذا لم يكن للجهاز مستخدم محدد.
+                            final ownerId =
+                                selectedUserId ?? widget.currentUser.id;
+
+                            setDialogState(() => saving = true);
+
+                            try {
+                              final values = <String, dynamic>{
+                                'network_name': name,
+                                'mikrotik_host': host,
+                                'mikrotik_username': username,
+                                'mikrotik_port': port,
+                                'device_id': selectedDeviceId,
+                                'user_id': ownerId,
+                              };
+
+                              if (existing == null) {
+                                values['setup_completed'] = false;
+                                await supabase
+                                    .from('network_connections')
+                                    .insert(values);
+                              } else {
+                                await supabase
+                                    .from('network_connections')
+                                    .update(values)
+                                    .eq('id', existing['id']);
+                              }
+
+                              if (!mounted || !dialogContext.mounted) return;
+
+                              Navigator.pop(dialogContext);
+                              setState(() {});
+
+                              ScaffoldMessenger.of(context).showSnackBar(
+                                const SnackBar(
+                                  content: Text('تم حفظ بيانات الشبكة بنجاح'),
+                                ),
+                              );
+                            } catch (e) {
+                              if (!mounted) return;
+                              ScaffoldMessenger.of(context).showSnackBar(
+                                SnackBar(content: Text('فشل حفظ الشبكة: $e')),
+                              );
+                              if (dialogContext.mounted) {
+                                setDialogState(() => saving = false);
+                              }
+                            }
+                          },
+                    icon: const Icon(Icons.save),
+                    label: Text(saving ? 'جارٍ الحفظ...' : 'حفظ'),
+                  ),
+                ],
+              );
+            },
+          );
+        },
+      );
+    } catch (e) {
+      if (mounted) {
+        ScaffoldMessenger.of(context)
+            .showSnackBar(SnackBar(content: Text('تعذر تحميل الأجهزة: $e')));
+      }
+    } finally {
+      nameController.dispose();
+      hostController.dispose();
+      usernameController.dispose();
+      portController.dispose();
+    }
+  }
+
+  Future<void> deleteMikrotikNetwork(Map<String, dynamic> network) async {
+    final confirmed = await showDialog<bool>(
+      context: context,
+      builder: (dialogContext) => AlertDialog(
+        title: const Text('حذف الشبكة'),
+        content: Text(
+          'هل تريد حذف تسجيل الشبكة '
+          '${network['network_name'] ?? ''}؟\n'
+          'لن يتم حذف جهاز MikroTik أو حساباته.',
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(dialogContext, false),
+            child: const Text('إلغاء'),
+          ),
+          FilledButton(
+            onPressed: () => Navigator.pop(dialogContext, true),
+            child: const Text('حذف'),
+          ),
+        ],
+      ),
+    );
+
+    if (confirmed != true || !mounted) return;
+
+    try {
+      await Supabase.instance.client
+          .from('network_connections')
+          .delete()
+          .eq('id', network['id']);
+
+      if (!mounted) return;
+
+      setState(() {});
+
+      ScaffoldMessenger.of(context)
+          .showSnackBar(const SnackBar(content: Text('تم حذف تسجيل الشبكة')));
+    } catch (e) {
+      if (!mounted) return;
+      ScaffoldMessenger.of(context)
+          .showSnackBar(SnackBar(content: Text('تعذر حذف الشبكة: $e')));
+    }
+  }
+
+  String buildMikrotikInstallerScript(String token) {
+    if (!RegExp(r'^[a-fA-F0-9]{64}$').hasMatch(token)) {
+      throw ArgumentError('Invalid MikroTik token');
+    }
+
+    const endpoint =
+        'https://wimfoaxolomefwuikywn.supabase.co/functions/v1/rapid-worker';
+
+    final syncSource = r"""
+:local netmanagerToken "__TOKEN__"
+:local url "__ENDPOINT__"
+:local headers ("Content-Type: application/json,X-MikroTik-Token: " . $netmanagerToken)
+:if ([/system script job print count-only where script="NetManager-Hotspot-Sync"] > 1) do={ :error "NetManager sync already running" }
+:local startResult [/tool fetch url=$url http-method=post http-header-field=$headers http-data="{\"action\":\"start\"}" output=user as-value]
+:local startData [:deserialize from=json value=($startResult->"data")]
+:if (($startData->"status") != "started") do={ :error "Unable to start synchronization" }
+:local runId ($startData->"run_id")
+:if ([:len $runId] != 36) do={ :error "Invalid synchronization ID" }
+:local accountIds [/ip hotspot user find]
+:local expectedCount [:len $accountIds]
+:local sentCount 0
+:foreach id in=$accountIds do={
+    :local accountData {
+        "action"="account";
+        "run_id"=$runId;
+        "mikrotik_user_id"=$id;
+        "username"=[/ip hotspot user get $id name];
+        "profile"=[/ip hotspot user get $id profile];
+        "disabled"=[/ip hotspot user get $id disabled]
+    }
+    :local jsonData [:serialize to=json value=$accountData]
+    :local result [/tool fetch url=$url http-method=post http-header-field=$headers http-data=$jsonData output=user as-value]
+    :local response [:deserialize from=json value=($result->"data")]
+    :if (($response->"status") != "saved") do={ :error "Hotspot account synchronization failed" }
+    :set sentCount ($sentCount + 1)
+}
+:if ($sentCount != $expectedCount) do={ :error "Account count mismatch" }
+:local finishData { "action"="finish"; "run_id"=$runId; "expected_count"=$expectedCount }
+:local finishJson [:serialize to=json value=$finishData]
+:local finishResult [/tool fetch url=$url http-method=post http-header-field=$headers http-data=$finishJson output=user as-value]
+:local finishResponse [:deserialize from=json value=($finishResult->"data")]
+:if (($finishResponse->"status") != "completed") do={ :error "Unable to finish synchronization" }
+:log info ("NetManager Hotspot sync completed: " . $sentCount . " accounts")
+""";
+
+    final source = syncSource
+        .replaceAll('__TOKEN__', token)
+        .replaceAll('__ENDPOINT__', endpoint)
+        .trim();
+
+    // Escape source so RouterOS stores it as script text,
+    // rather than executing its contents during installation.
+    final escapedSource = source
+        .replaceAll(r'\', r'\\')
+        .replaceAll(r'$', r'\$')
+        .replaceAll('"', r'\"')
+        .replaceAll('\n', r'\r\n');
+
+    return [
+      '# NetManager MikroTik Installer',
+      '# Contains a private network token: keep this script confidential.',
+      '# Install only on the intended new router.',
+      ':local scriptName "NetManager-Hotspot-Sync"',
+      ':local schedulerName "NetManager-Hotspot-Schedule"',
+      ':if ([:len [/system script find where name=\$scriptName]] > 0) do={ :error "NetManager script already exists; installation stopped" }',
+      ':if ([:len [/system scheduler find where name=\$schedulerName]] > 0) do={ :error "NetManager scheduler already exists; installation stopped" }',
+      '/system script add name=\$scriptName policy=read,test source="$escapedSource"',
+      '/system scheduler add name=\$schedulerName interval=15m policy=read,test on-event="/system script run NetManager-Hotspot-Sync"',
+      ':log info "NetManager Hotspot sync installed; interval 15 minutes"',
+    ].join('\n');
+  }
+
+  Future<void> showMikrotikSetupDialog(Map<String, dynamic> network) async {
+    if (widget.currentUser.role != 'مدير') return;
+    if (!mounted) return;
+
+    final networkName = network['network_name']?.toString() ?? 'شبكة MikroTik';
+
+    final setupScript = [
+      '# NetManager - Preview Only',
+      '# Do not execute on MikroTik yet',
+      '# Hotspot sync interval: 15 minutes',
+      '# Script name: NetManager-Hotspot-Sync',
+    ].join('\\n');
+
+    await showDialog<void>(
+      context: context,
+      builder: (dialogContext) => AlertDialog(
+        title: const Text('تجهيز ربط MikroTik'),
+        content: SizedBox(
+          width: 550,
+          child: SingleChildScrollView(
+            child: Column(
+              mainAxisSize: MainAxisSize.min,
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Text(
+                  networkName,
+                  style: const TextStyle(fontWeight: FontWeight.bold),
+                ),
+                const SizedBox(height: 12),
+                const Text('مزامنة حسابات Hotspot كل 15 دقيقة'),
+                const SizedBox(height: 12),
+                const Text('هذه معاينة فقط. لا تنفذ النص على الراوتر بعد.'),
+                const SizedBox(height: 12),
+                SelectableText(setupScript, textDirection: TextDirection.ltr),
+              ],
+            ),
+          ),
+        ),
+        actions: [
+          TextButton.icon(
+            onPressed: () async {
+              final confirmed = await showDialog<bool>(
+                context: dialogContext,
+                builder: (confirmContext) => AlertDialog(
+                  title: const Text('تأكيد إنشاء سكربت التثبيت'),
+                  content: const Text(
+                    'سيتم إصدار رمز ربط جديد لهذه الشبكة، '
+                    'وسيُلغى الرمز السابق فورًا. '
+                    'قد تتوقف المزامنة الحالية حتى تثبيت الرمز الجديد. '
+                    'هل تريد المتابعة؟',
+                  ),
+                  actions: [
+                    TextButton(
+                      onPressed: () => Navigator.pop(confirmContext, false),
+                      child: const Text('إلغاء'),
+                    ),
+                    FilledButton(
+                      onPressed: () => Navigator.pop(confirmContext, true),
+                      child: const Text('إنشاء الرمز والسكربت'),
+                    ),
+                  ],
+                ),
+              );
+
+              if (confirmed != true || !dialogContext.mounted) return;
+
+              final connectionId = network['id']?.toString();
+              if (connectionId == null || connectionId.isEmpty) return;
+
+              String script;
+
+              try {
+                final result = await Supabase.instance.client.rpc(
+                  'create_mikrotik_router_token',
+                  params: {'p_connection_id': connectionId},
+                );
+
+                script = buildMikrotikInstallerScript(result.toString());
+              } catch (e) {
+                if (!dialogContext.mounted) return;
+                ScaffoldMessenger.of(dialogContext).showSnackBar(
+                  SnackBar(content: Text('تعذر إنشاء سكربت التثبيت: $e')),
+                );
+                return;
+              }
+
+              if (!dialogContext.mounted) return;
+
+              if (!dialogContext.mounted) return;
+
+              await showDialog<void>(
+                context: dialogContext,
+                builder: (previewContext) => AlertDialog(
+                  title: const Text('سكربت تثبيت MikroTik'),
+                  content: SizedBox(
+                    width: 600,
+                    child: SingleChildScrollView(
+                      child: SelectableText(
+                        script,
+                        textDirection: TextDirection.ltr,
+                      ),
+                    ),
+                  ),
+                  actions: [
+                    TextButton.icon(
+                      onPressed: () async {
+                        await Clipboard.setData(ClipboardData(text: script));
+                        if (!previewContext.mounted) return;
+                        ScaffoldMessenger.of(previewContext).showSnackBar(
+                          const SnackBar(content: Text('تم نسخ السكربت بنجاح')),
+                        );
+                      },
+                      icon: const Icon(Icons.copy),
+                      label: const Text('نسخ السكربت'),
+                    ),
+                    FilledButton(
+                      onPressed: () => Navigator.pop(previewContext),
+                      child: const Text('إغلاق'),
+                    ),
+                  ],
+                ),
+              );
+            },
+            icon: const Icon(Icons.settings),
+            label: const Text('إنشاء سكربت تثبيت جديد'),
+          ),
+          TextButton.icon(
+            onPressed: () async {
+              await Clipboard.setData(ClipboardData(text: setupScript));
+              if (!dialogContext.mounted) return;
+              ScaffoldMessenger.of(dialogContext).showSnackBar(
+                const SnackBar(content: Text('تم نسخ معاينة السكربت')),
+              );
+            },
+            icon: const Icon(Icons.copy),
+            label: const Text('نسخ السكربت'),
+          ),
+          FilledButton(
+            onPressed: () => Navigator.pop(dialogContext),
+            child: const Text('إغلاق'),
+          ),
+        ],
+      ),
+    );
+  }
+
+  Future<void> createMikrotikConnectionToken(
+    Map<String, dynamic> network,
+  ) async {
+    if (widget.currentUser.role != 'مدير') return;
+
+    final connectionId = network['id']?.toString();
+    if (connectionId == null || connectionId.isEmpty) return;
+
+    try {
+      final result = await Supabase.instance.client.rpc(
+        'create_mikrotik_router_token',
+        params: {'p_connection_id': connectionId},
+      );
+
+      final token = result.toString();
+
+      if (!mounted) return;
+
+      await showDialog<void>(
+        context: context,
+        builder: (dialogContext) => AlertDialog(
+          title: const Text('رمز ربط MikroTik'),
+          content: SizedBox(
+            width: 450,
+            child: Column(
+              mainAxisSize: MainAxisSize.min,
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Text(
+                  network['network_name']?.toString() ?? 'شبكة MikroTik',
+                  style: const TextStyle(fontWeight: FontWeight.bold),
+                ),
+                const SizedBox(height: 12),
+                const Text(
+                  'احتفظ بهذا الرمز في مكان آمن. '
+                  'لن يظهر مرة أخرى بعد إغلاق النافذة.',
+                ),
+                const SizedBox(height: 12),
+                SelectableText(token, textDirection: TextDirection.ltr),
+              ],
+            ),
+          ),
+          actions: [
+            TextButton.icon(
+              onPressed: () async {
+                await Clipboard.setData(ClipboardData(text: token));
+                if (dialogContext.mounted) {
+                  ScaffoldMessenger.of(dialogContext).showSnackBar(
+                    const SnackBar(content: Text('تم نسخ رمز الربط')),
+                  );
+                }
+              },
+              icon: const Icon(Icons.copy),
+              label: const Text('نسخ الرمز'),
+            ),
+            FilledButton(
+              onPressed: () => Navigator.pop(dialogContext),
+              child: const Text('إغلاق'),
+            ),
+          ],
+        ),
+      );
+    } catch (e) {
+      if (!mounted) return;
+      ScaffoldMessenger.of(context)
+          .showSnackBar(SnackBar(content: Text('تعذر إنشاء رمز الربط: $e')));
+    }
+  }
+
+  Future<void> showMikrotikHotspotProfiles(Map<String, dynamic> network) async {
+    if (widget.currentUser.role != 'مدير') return;
+
+    final connectionId = network['id']?.toString();
+    if (connectionId == null || connectionId.isEmpty) return;
+
+    try {
+      final profiles = await Supabase.instance.client
+          .from('mikrotik_hotspot_profiles')
+          .select('name, rate_limit, shared_users, sync_status, last_seen_at')
+          .eq('connection_id', connectionId)
+          .order('name');
+
+      if (!mounted) return;
+
+      await showDialog<void>(
+        context: context,
+        builder: (dialogContext) => AlertDialog(
+          title: Text('باقات Hotspot - ${network['network_name'] ?? ''}'),
+          content: SizedBox(
+            width: 550,
+            height: 420,
+            child: profiles.isEmpty
+                ? const Center(child: Text('لا توجد باقات تمت مزامنتها'))
+                : ListView.builder(
+                    itemCount: profiles.length,
+                    itemBuilder: (context, index) {
+                      final profile = profiles[index];
+                      final name = profile['name']?.toString() ?? '';
+                      final rate = profile['rate_limit']?.toString();
+                      final shared = profile['shared_users']?.toString();
+                      final present = profile['sync_status'] == 'present';
+
+                      return Card(
+                        child: ListTile(
+                          leading: Icon(
+                            Icons.speed,
+                            color: present ? Colors.green : Colors.orange,
+                          ),
+                          title: Text(name),
+                          subtitle: Text(
+                            'السرعة: ${rate == null || rate.isEmpty ? "غير محددة" : rate}\\n'
+                            'عدد المستخدمين: ${shared ?? "غير محدد"}\\n'
+                            'الحالة: ${present ? "موجودة على الراوتر" : "غير موجودة في آخر مزامنة مكتملة"}',
+                          ),
+                          isThreeLine: true,
+                        ),
+                      );
+                    },
+                  ),
+          ),
+          actions: [
+            TextButton(
+              onPressed: () => Navigator.pop(dialogContext),
+              child: const Text('إغلاق'),
+            ),
+          ],
+        ),
+      );
+    } catch (e) {
+      if (!mounted) return;
+      ScaffoldMessenger.of(
+        context,
+      ).showSnackBar(SnackBar(content: Text('تعذر تحميل باقات Hotspot: $e')));
+    }
+  }
+
+  Future<void> showMikrotikSyncedHotspotAccounts(
+    Map<String, dynamic> network,
+  ) async {
+    if (widget.currentUser.role != 'مدير') return;
+
+    final connectionId = network['id']?.toString();
+    if (connectionId == null || connectionId.isEmpty) return;
+
+    try {
+      final accounts = await Supabase.instance.client
+          .from('mikrotik_hotspot_sync')
+          .select('username, profile, disabled, last_seen_at')
+          .eq('connection_id', connectionId)
+          .order('username');
+
+      if (!mounted) return;
+
+      await showDialog<void>(
+        context: context,
+        builder: (dialogContext) => AlertDialog(
+          title: Text('حسابات Hotspot - ${network['network_name'] ?? ''}'),
+          content: SizedBox(
+            width: 550,
+            height: 400,
+            child: accounts.isEmpty
+                ? const Center(child: Text('لا توجد حسابات مستوردة'))
+                : ListView.builder(
+                    itemCount: accounts.length,
+                    itemBuilder: (context, index) {
+                      final account = accounts[index];
+                      final disabled = account['disabled'] == true;
+
+                      return Card(
+                        child: ListTile(
+                          leading: Icon(
+                            disabled ? Icons.person_off : Icons.person,
+                            color: disabled ? Colors.red : Colors.green,
+                          ),
+                          title: Text(account['username']?.toString() ?? ''),
+                          subtitle: Text(
+                            'البروفايل: ${account['profile'] ?? '-'}\\n'
+                            'آخر مزامنة: ${account['last_seen_at'] ?? '-'}',
+                          ),
+                          trailing: Chip(
+                            label: Text(disabled ? 'معطّل' : 'فعال'),
+                          ),
+                        ),
+                      );
+                    },
+                  ),
+          ),
+          actions: [
+            TextButton(
+              onPressed: () => Navigator.pop(dialogContext),
+              child: const Text('إغلاق'),
+            ),
+          ],
+        ),
+      );
+    } catch (e) {
+      if (!mounted) return;
+      ScaffoldMessenger.of(
+        context,
+      ).showSnackBar(SnackBar(content: Text('تعذر تحميل حسابات Hotspot: $e')));
+    }
+  }
+
+  Widget buildMikrotikSyncStatus(
+    String connectionId, {
+    String syncType = 'hotspot',
+  }) {
+    return FutureBuilder<List<Map<String, dynamic>>>(
+      future: Supabase.instance.client
+          .from('mikrotik_sync_runs')
+          .select('status, accounts_count, started_at, completed_at')
+          .eq('connection_id', connectionId)
+          .eq('sync_type', syncType)
+          .order('started_at', ascending: false)
+          .limit(1),
+      builder: (context, snapshot) {
+        if (snapshot.connectionState == ConnectionState.waiting) {
+          return const Text('جاري فحص المزامنة...');
+        }
+
+        if (snapshot.hasError) {
+          return const Text('تعذر قراءة حالة المزامنة');
+        }
+
+        final rows = snapshot.data ?? [];
+        if (rows.isEmpty) {
+          return const Text('لم تُسجل أي مزامنة بعد');
+        }
+
+        final run = rows.first;
+        final status = run['status']?.toString() ?? 'unknown';
+        final count = run['accounts_count'] ?? 0;
+
+        final dateValue = run['completed_at'] ?? run['started_at'];
+        final parsedDate = DateTime.tryParse(dateValue?.toString() ?? '');
+        final localDate = parsedDate?.toLocal();
+
+        String twoDigits(int value) => value.toString().padLeft(2, '0');
+
+        final formattedDate = localDate == null
+            ? '-'
+            : '${localDate.year}-'
+                  '${twoDigits(localDate.month)}-'
+                  '${twoDigits(localDate.day)} '
+                  '${twoDigits(localDate.hour)}:'
+                  '${twoDigits(localDate.minute)}';
+
+        final Color statusColor;
+        final IconData statusIcon;
+        final String statusText;
+
+        final lastSuccess = status == 'completed'
+            ? DateTime.tryParse(run['completed_at']?.toString() ?? '')
+            : null;
+
+        final isDelayed =
+            lastSuccess != null &&
+            DateTime.now().toUtc().difference(lastSuccess.toUtc()) >
+                const Duration(minutes: 30);
+
+        switch (status) {
+          case 'completed':
+            statusColor = isDelayed ? Colors.orange : Colors.green;
+            statusIcon = isDelayed
+                ? Icons.warning_amber_rounded
+                : Icons.check_circle;
+            statusText = isDelayed
+                ? 'متأخرة أكثر من 30 دقيقة'
+                : 'مكتملة حديثًا';
+            break;
+          case 'failed':
+            statusColor = Colors.red;
+            statusIcon = Icons.error;
+            statusText = 'فشلت';
+            break;
+          case 'running':
+            statusColor = Colors.orange;
+            statusIcon = Icons.sync;
+            statusText = 'قيد التنفيذ';
+            break;
+          default:
+            statusColor = Colors.grey;
+            statusIcon = Icons.help_outline;
+            statusText = 'غير معروفة';
+        }
+
+        return Row(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            Icon(statusIcon, color: statusColor, size: 19),
+            const SizedBox(width: 6),
+            Flexible(
+              child: Text(
+                'آخر مزامنة: $statusText | الحسابات: $count\\n'
+                'التاريخ: $formattedDate',
+                style: TextStyle(
+                  fontSize: 12,
+                  color: statusColor,
+                  fontWeight: FontWeight.w600,
+                ),
+              ),
+            ),
+          ],
+        );
+      },
+    );
+  }
+
+  Future<void> showMikrotikSyncHistory(Map<String, dynamic> network) async {
+    if (widget.currentUser.role != 'مدير' || !mounted) return;
+
+    final connectionId = network['id']?.toString();
+    if (connectionId == null || connectionId.isEmpty) return;
+
+    final networkName = network['network_name']?.toString() ?? 'شبكة MikroTik';
+
+    String formatSyncDate(dynamic value) {
+      final date = DateTime.tryParse(value?.toString() ?? '')?.toLocal();
+      if (date == null) return '-';
+
+      String two(int n) => n.toString().padLeft(2, '0');
+
+      return '${date.year}-${two(date.month)}-${two(date.day)} '
+          '${two(date.hour)}:${two(date.minute)}';
+    }
+
+    await showDialog<void>(
+      context: context,
+      builder: (dialogContext) => AlertDialog(
+        title: Text('سجل المزامنة - $networkName'),
+        content: SizedBox(
+          width: 650,
+          height: 450,
+          child: FutureBuilder<List<Map<String, dynamic>>>(
+            future: Supabase.instance.client
+                .from('mikrotik_sync_runs')
+                .select(
+                  'sync_type, status, accounts_count, started_at, completed_at, error_message',
+                )
+                .eq('connection_id', connectionId)
+                .order('started_at', ascending: false)
+                .limit(20),
+            builder: (context, snapshot) {
+              if (snapshot.connectionState == ConnectionState.waiting) {
+                return const Center(child: CircularProgressIndicator());
+              }
+
+              if (snapshot.hasError) {
+                return Center(
+                  child: Text('تعذر تحميل سجل المزامنة: ${snapshot.error}'),
+                );
+              }
+
+              final runs = snapshot.data ?? [];
+
+              if (runs.isEmpty) {
+                return const Center(child: Text('لا توجد عمليات مزامنة مسجلة'));
+              }
+
+              return ListView.separated(
+                itemCount: runs.length,
+                separatorBuilder: (context, index) => const Divider(),
+                itemBuilder: (context, index) {
+                  final run = runs[index];
+                  final status = run['status']?.toString() ?? '';
+                  final syncType = run['sync_type']?.toString() ?? '';
+                  final isProfiles = syncType == 'hotspot_profiles';
+                  final syncLabel = isProfiles
+                      ? 'باقات Hotspot'
+                      : syncType == 'hotspot'
+                      ? 'حسابات Hotspot'
+                      : 'مزامنة غير معروفة';
+                  final countLabel = isProfiles
+                      ? 'عدد الباقات'
+                      : 'عدد الحسابات';
+                  final errorMessage =
+                      run['error_message']?.toString().trim() ?? '';
+
+                  final IconData icon;
+                  final Color color;
+                  final String statusText;
+
+                  switch (status) {
+                    case 'completed':
+                      icon = Icons.check_circle;
+                      color = Colors.green;
+                      statusText = 'مكتملة';
+                      break;
+                    case 'failed':
+                      icon = Icons.error;
+                      color = Colors.red;
+                      statusText = 'فشلت';
+                      break;
+                    case 'running':
+                      icon = Icons.sync;
+                      color = Colors.orange;
+                      statusText = 'قيد التنفيذ';
+                      break;
+                    default:
+                      icon = Icons.help_outline;
+                      color = Colors.grey;
+                      statusText = 'غير معروفة';
+                  }
+
+                  return ListTile(
+                    leading: Icon(icon, color: color),
+                    title: Text(
+                      '$syncLabel: $statusText',
+                      style: TextStyle(
+                        fontWeight: FontWeight.bold,
+                        color: color,
+                      ),
+                    ),
+                    subtitle: Text(
+                      '$countLabel: ${run['accounts_count'] ?? 0}\n'
+                      'البدء: ${formatSyncDate(run['started_at'])}\n'
+                      'الانتهاء: ${formatSyncDate(run['completed_at'])}'
+                      '${status == 'failed' && errorMessage.isNotEmpty ? '\nسبب الفشل: $errorMessage' : ''}',
+                    ),
+                    isThreeLine: true,
+                    titleAlignment: ListTileTitleAlignment.top,
+                    trailing: status == 'failed' && errorMessage.isNotEmpty
+                        ? Tooltip(
+                            message: errorMessage,
+                            child: const Icon(
+                              Icons.info_outline,
+                              color: Colors.red,
+                            ),
+                          )
+                        : null,
+                  );
+                },
+              );
+            },
+          ),
+        ),
+        actions: [
+          FilledButton(
+            onPressed: () => Navigator.pop(dialogContext),
+            child: const Text('إغلاق'),
+          ),
+        ],
+      ),
+    );
+  }
+
+  Widget buildMikrotikNetworks() {
+    return FutureBuilder<List<Map<String, dynamic>>>(
+      future: Supabase.instance.client
+          .from('network_connections')
+          .select()
+          .order('created_at'),
+      builder: (context, snapshot) {
+        if (snapshot.connectionState == ConnectionState.waiting) {
+          return const Center(child: CircularProgressIndicator());
+        }
+
+        if (snapshot.hasError) {
+          return Center(child: Text('تعذر تحميل الشبكات: ${snapshot.error}'));
+        }
+
+        final networks = snapshot.data ?? [];
+
+        return Column(
+          children: [
+            Padding(
+              padding: const EdgeInsets.all(16),
+              child: Wrap(
+                spacing: 12,
+                runSpacing: 12,
+                crossAxisAlignment: WrapCrossAlignment.center,
+                children: [
+                  const Text(
+                    'إدارة شبكات MikroTik',
+                    style: TextStyle(fontSize: 22, fontWeight: FontWeight.bold),
+                  ),
+                  FilledButton.icon(
+                    onPressed: () => openMikrotikNetworkDialog(),
+                    icon: const Icon(Icons.add),
+                    label: const Text('إضافة شبكة جديدة'),
+                  ),
+                  IconButton(
+                    tooltip: 'تحديث',
+                    onPressed: () => setState(() {}),
+                    icon: const Icon(Icons.refresh),
+                  ),
+                ],
+              ),
+            ),
+            Expanded(
+              child: networks.isEmpty
+                  ? const Center(child: Text('لا توجد شبكات مسجلة حتى الآن'))
+                  : ListView.builder(
+                      padding: const EdgeInsets.all(12),
+                      itemCount: networks.length,
+                      itemBuilder: (context, index) {
+                        final network = networks[index];
+                        final completed = network['setup_completed'] == true;
+
+                        return Card(
+                          child: ListTile(
+                            leading: const CircleAvatar(
+                              child: Icon(Icons.router),
+                            ),
+                            title: Text(
+                              network['network_name']?.toString() ??
+                                  'شبكة بدون اسم',
+                            ),
+                            subtitle: Column(
+                              crossAxisAlignment: CrossAxisAlignment.start,
+                              mainAxisSize: MainAxisSize.min,
+                              children: [
+                                Text(
+                                  'العنوان: ${network['mikrotik_host'] ?? '-'}\n'
+                                  'المنفذ: ${network['mikrotik_port'] ?? 8728}\n'
+                                  'اسم المستخدم: '
+                                  '${network['mikrotik_username'] ?? '-'}',
+                                ),
+                                const SizedBox(height: 8),
+                                const SizedBox(height: 6),
+                                const Text(
+                                  'حسابات Hotspot',
+                                  style: TextStyle(fontWeight: FontWeight.bold),
+                                ),
+                                buildMikrotikSyncStatus(
+                                  network['id'].toString(),
+                                  syncType: 'hotspot',
+                                ),
+                                const SizedBox(height: 8),
+                                const Text(
+                                  'باقات Hotspot',
+                                  style: TextStyle(fontWeight: FontWeight.bold),
+                                ),
+                                buildMikrotikSyncStatus(
+                                  network['id'].toString(),
+                                  syncType: 'hotspot_profiles',
+                                ),
+                              ],
+                            ),
+                            isThreeLine: true,
+                            trailing: Wrap(
+                              crossAxisAlignment: WrapCrossAlignment.center,
+                              spacing: 4,
+                              children: [
+                                Chip(
+                                  label: Text(
+                                    completed
+                                        ? 'الإعداد مكتمل'
+                                        : 'لم يتم الاختبار',
+                                  ),
+                                ),
+                                IconButton(
+                                  tooltip: 'عرض حسابات Hotspot',
+                                  onPressed: () =>
+                                      showMikrotikSyncedHotspotAccounts(
+                                        network,
+                                      ),
+                                  icon: const Icon(
+                                    Icons.people_alt,
+                                    color: Colors.blue,
+                                  ),
+                                ),
+                                IconButton(
+                                  tooltip: 'عرض باقات Hotspot',
+                                  onPressed: () =>
+                                      showMikrotikHotspotProfiles(network),
+                                  icon: const Icon(
+                                    Icons.speed,
+                                    color: Colors.deepPurple,
+                                  ),
+                                ),
+                                IconButton(
+                                  tooltip: 'سجل المزامنة',
+                                  onPressed: () =>
+                                      showMikrotikSyncHistory(network),
+                                  icon: const Icon(
+                                    Icons.history,
+                                    color: Colors.teal,
+                                  ),
+                                ),
+                                IconButton(
+                                  tooltip: 'تجهيز ربط MikroTik',
+                                  onPressed: () =>
+                                      showMikrotikSetupDialog(network),
+                                  icon: const Icon(
+                                    Icons.install_desktop,
+                                    color: Colors.deepPurple,
+                                  ),
+                                ),
+                                IconButton(
+                                  tooltip: 'إنشاء رمز ربط',
+                                  onPressed: () =>
+                                      createMikrotikConnectionToken(network),
+                                  icon: const Icon(
+                                    Icons.vpn_key,
+                                    color: Colors.green,
+                                  ),
+                                ),
+                                IconButton(
+                                  tooltip: 'تعديل',
+                                  onPressed: () => openMikrotikNetworkDialog(
+                                    existing: network,
+                                  ),
+                                  icon: const Icon(Icons.edit),
+                                ),
+                                IconButton(
+                                  tooltip: 'حذف',
+                                  onPressed: () =>
+                                      deleteMikrotikNetwork(network),
+                                  icon: const Icon(
+                                    Icons.delete_outline,
+                                    color: Colors.red,
+                                  ),
+                                ),
+                              ],
+                            ),
+                          ),
+                        );
+                      },
+                    ),
+            ),
+          ],
+        );
+      },
+    );
   }
 
   Widget buildDevices() {

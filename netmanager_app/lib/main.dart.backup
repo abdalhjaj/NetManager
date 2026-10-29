@@ -1,0 +1,1499 @@
+import 'package:supabase_flutter/supabase_flutter.dart';
+import 'supabase_config.dart';
+import 'package:flutter/material.dart';
+
+final List<AppUser> users = [];
+AppUser? currentUser;
+
+Future<void> main() async {
+  WidgetsFlutterBinding.ensureInitialized();
+  await Supabase.initialize(
+    url: supabaseUrl,
+    publishableKey: supabasePublishableKey,
+  );
+  try {
+    await loadUsers();
+    await loadDevices();
+  } catch (e, stackTrace) {
+    debugPrint('SUPABASE LOAD ERROR: $e');
+    debugPrintStack(stackTrace: stackTrace);
+  }
+
+  if (users.isEmpty) {
+    users.add(
+      AppUser(
+        username: 'admin',
+        password: 'admin123',
+        name: 'مدير النظام',
+        role: 'مدير',
+        active: true,
+      ),
+    );
+    await saveUsers();
+  }
+
+  runApp(const NetManagerApp());
+}
+
+class AppUser {
+  String id;
+  String username;
+  String password;
+  String name;
+  String role;
+  bool active;
+
+  AppUser({
+    this.id = '',
+    required this.username,
+    required this.password,
+    required this.name,
+    required this.role,
+    this.active = true,
+  });
+
+  Map<String, dynamic> toJson() {
+    return {
+      'username': username,
+      'password': password,
+      'name': name,
+      'role': role,
+      'active': active,
+    };
+  }
+
+  factory AppUser.fromJson(Map<String, dynamic> json) {
+    return AppUser(
+      id: json['id']?.toString() ?? '',
+      username: json['username'] ?? '',
+      password: json['password'] ?? '',
+      name: json['name'] ?? '',
+      role: json['role'] ?? 'مستخدم',
+      active: json['active'] ?? true,
+    );
+  }
+}
+
+Future<void> saveUsers() async {
+  final supabase = Supabase.instance.client;
+
+  await supabase.from('app_users').delete().not('id', 'is', null);
+
+  if (users.isEmpty) return;
+
+  await supabase.from('app_users').insert(
+    users.map((user) => user.toJson()).toList(),
+  );
+}
+
+Future<void> loadUsers() async {
+  final supabase = Supabase.instance.client;
+
+  final data = await supabase
+      .from('app_users')
+      .select()
+      .order('created_at');
+
+  users.clear();
+
+  for (final item in data) {
+    users.add(
+      AppUser.fromJson(
+        Map<String, dynamic>.from(item),
+      ),
+    );
+  }
+}
+
+class NetManagerApp extends StatelessWidget {
+  const NetManagerApp({super.key});
+
+  @override
+  Widget build(BuildContext context) {
+    return MaterialApp(
+      debugShowCheckedModeBanner: false,
+      title: 'NetManager',
+      theme: ThemeData(
+        useMaterial3: true,
+        colorScheme: ColorScheme.fromSeed(
+          seedColor: const Color(0xFF1565C0),
+        ),
+      ),
+      home: const LoginPage(),
+    );
+  }
+}
+
+class LoginPage extends StatefulWidget {
+  const LoginPage({super.key});
+
+  @override
+  State<LoginPage> createState() => _LoginPageState();
+}
+
+class _LoginPageState extends State<LoginPage> {
+  final usernameController = TextEditingController();
+  final passwordController = TextEditingController();
+
+  bool hidePassword = true;
+
+  Future<void> login() async {
+    final username = usernameController.text.trim();
+    final password = passwordController.text;
+
+    AppUser? user;
+
+    for (final item in users) {
+      if (item.username == username &&
+    item.password == password) {
+
+  currentUser = item;
+
+  await loadDevices();
+
+  if (!context.mounted) return;
+
+  Navigator.pushReplacement(
+    context,
+    MaterialPageRoute(
+      builder: (_) => DashboardPage(
+  currentUser: currentUser!,
+),
+    ),
+  );
+}
+    }
+
+    if (user == null) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(
+          content: Text('اسم المستخدم أو كلمة المرور غير صحيحة'),
+        ),
+      );
+      return;
+    }
+
+    Navigator.pushReplacement(
+      context,
+      MaterialPageRoute(
+        builder: (_) => DashboardPage(currentUser: user!),
+      ),
+    );
+  }
+
+  @override
+  void dispose() {
+    usernameController.dispose();
+    passwordController.dispose();
+    super.dispose();
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return Directionality(
+      textDirection: TextDirection.rtl,
+      child: Scaffold(
+        backgroundColor: Colors.grey.shade100,
+        body: SafeArea(
+          child: Center(
+            child: SingleChildScrollView(
+              padding: const EdgeInsets.all(24),
+              child: ConstrainedBox(
+                constraints: const BoxConstraints(maxWidth: 430),
+                child: Card(
+                  elevation: 6,
+                  child: Padding(
+                    padding: const EdgeInsets.all(28),
+                    child: Column(
+                      children: [
+                        Container(
+                          width: 85,
+                          height: 85,
+                          decoration: BoxDecoration(
+                            color: Colors.blue.shade700,
+                            borderRadius: BorderRadius.circular(22),
+                          ),
+                          child: const Icon(
+                            Icons.router,
+                            color: Colors.white,
+                            size: 48,
+                          ),
+                        ),
+                        const SizedBox(height: 18),
+                        const Text(
+                          'NetManager',
+                          style: TextStyle(
+                            fontSize: 30,
+                            fontWeight: FontWeight.bold,
+                          ),
+                        ),
+                        const SizedBox(height: 6),
+                        Text(
+                          'إدارة شبكة الإنترنت',
+                          style: TextStyle(
+                            color: Colors.grey.shade600,
+                          ),
+                        ),
+                        const SizedBox(height: 30),
+                        TextField(
+                          controller: usernameController,
+                          decoration: const InputDecoration(
+                            labelText: 'اسم المستخدم',
+                            prefixIcon: Icon(Icons.person),
+                            border: OutlineInputBorder(),
+                          ),
+                        ),
+                        const SizedBox(height: 16),
+                        TextField(
+                          controller: passwordController,
+                          obscureText: hidePassword,
+                          onSubmitted: (_) => login(),
+                          decoration: InputDecoration(
+                            labelText: 'كلمة المرور',
+                            prefixIcon: const Icon(Icons.lock),
+                            border: const OutlineInputBorder(),
+                            suffixIcon: IconButton(
+                              icon: Icon(
+                                hidePassword
+                                    ? Icons.visibility
+                                    : Icons.visibility_off,
+                              ),
+                              onPressed: () {
+                                setState(() {
+                                  hidePassword = !hidePassword;
+                                });
+                              },
+                            ),
+                          ),
+                        ),
+                        const SizedBox(height: 22),
+                        SizedBox(
+                          width: double.infinity,
+                          height: 52,
+                          child: FilledButton.icon(
+                            onPressed: login,
+                            icon: const Icon(Icons.login),
+                            label: const Text('تسجيل الدخول'),
+                          ),
+                        ),
+                        const SizedBox(height: 18),
+                        Text(
+                          'الإصدار v0.16',
+                          style: TextStyle(
+                            color: Colors.grey.shade500,
+                          ),
+                        ),
+                      ],
+                    ),
+                  ),
+                ),
+              ),
+            ),
+          ),
+        ),
+      ),
+    );
+  }
+}
+class NetworkDevice {
+  String id;
+  String name;
+  String deviceType;
+  String ipAddress;
+  bool active;
+  String? userId;
+  bool isOnline;
+  DateTime? lastCheck;
+
+  NetworkDevice({
+    this.id = '',
+    required this.name,
+    required this.deviceType,
+    required this.ipAddress,
+    this.active = true,
+    this.isOnline = false,
+    this.lastCheck,
+  });
+
+  factory NetworkDevice.fromJson(Map<String, dynamic> json) {
+    return NetworkDevice(
+      id: json['id']?.toString() ?? '',
+      name: json['name'] ?? '',
+      deviceType: json['device_type'] ?? '',
+      ipAddress: json['ip_address'] ?? '',
+      active: json['active'] ?? true,
+      isOnline: json['is_online'] ?? false,
+      lastCheck: json['last_check'] != null
+          ? DateTime.tryParse(json['last_check'])
+          : null,
+    );
+  }
+  Map<String, dynamic> toJson() {
+    return {
+      'name': name,
+      'device_type': deviceType,
+      'ip_address': ipAddress,
+      'active': active,
+      'is_online': isOnline,
+      'last_check': lastCheck?.toIso8601String(),
+    };
+  }
+}
+
+final List<NetworkDevice> devices = [];
+
+Future<void> loadDevices() async {
+  final supabase = Supabase.instance.client;
+
+  devices.clear();
+
+  // قبل تسجيل الدخول لا نعرض أي أجهزة
+  if (currentUser == null) {
+    return;
+  }
+
+  dynamic data;
+
+  // المدير يرى جميع الأجهزة
+  if (currentUser!.role == 'مدير') {
+    data = await supabase
+        .from('network_devices')
+        .select()
+        .order('created_at');
+  } else {
+    // المستخدم العادي يرى أجهزته فقط
+    data = await supabase
+        .from('network_devices')
+        .select()
+        .eq('user_id', currentUser!.id)
+        .order('created_at');
+  }
+
+  for (final item in data) {
+    devices.add(
+      NetworkDevice.fromJson(
+        Map<String, dynamic>.from(item),
+      ),
+    );
+  }
+}
+class DashboardPage extends StatefulWidget {
+  final AppUser currentUser;
+
+  const DashboardPage({
+    super.key,
+    required this.currentUser,
+  });
+
+  @override
+  State<DashboardPage> createState() => _DashboardPageState();
+}
+
+class _DashboardPageState extends State<DashboardPage> {
+  int selectedIndex = 0;
+
+
+
+  Future<void> checkDeviceStatus(NetworkDevice device) async {
+    try {
+      final supabase = Supabase.instance.client;
+
+      // فحص مبدئي (سيتم ربطه لاحقاً بفحص Ping حقيقي)
+      final online = device.active;
+
+      await supabase
+          .from('network_devices')
+          .update({
+            'is_online': online,
+            'last_check': DateTime.now().toIso8601String(),
+          })
+          .eq('id', device.id);
+
+      device.isOnline = online;
+      device.lastCheck = DateTime.now();
+
+      if (mounted) {
+        setState(() {});
+      }
+
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(
+          content: Text(
+            online
+                ? 'الجهاز متصل'
+                : 'الجهاز غير متصل',
+          ),
+        ),
+      );
+    } catch (e) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(
+          content: Text('خطأ أثناء فحص الجهاز: $e'),
+        ),
+      );
+    }
+  }
+
+  Future<void> toggleUserStatus(AppUser user) async {
+    final newStatus = !user.active;
+
+    try {
+      await Supabase.instance.client
+          .from('app_users')
+          .update({
+            'active': newStatus,
+          })
+          .eq('id', user.id);
+
+      user.active = newStatus;
+
+      if (!mounted) return;
+
+      setState(() {});
+
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(
+          content: Text(
+            newStatus
+                ? 'تم تفعيل المستخدم'
+                : 'تم إيقاف المستخدم',
+          ),
+        ),
+      );
+    } catch (e) {
+      if (!mounted) return;
+
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(
+          content: Text('حدث خطأ أثناء تغيير حالة المستخدم: $e'),
+        ),
+      );
+    }
+  }
+
+  void editUser(AppUser user) {
+    final nameController = TextEditingController(text: user.name);
+    final usernameController = TextEditingController(text: user.username);
+    final passwordController = TextEditingController(text: user.password);
+    String role = user.role;
+
+    showDialog(
+      context: context,
+      builder: (dialogContext) {
+        return StatefulBuilder(
+          builder: (context, setDialogState) {
+            return AlertDialog(
+              title: const Text('تعديل المستخدم'),
+              content: SingleChildScrollView(
+                child: Column(
+                  mainAxisSize: MainAxisSize.min,
+                  children: [
+                    TextField(
+                      controller: nameController,
+                      decoration: const InputDecoration(
+                        labelText: 'الاسم',
+                      ),
+                    ),
+                    TextField(
+                      controller: usernameController,
+                      decoration: const InputDecoration(
+                        labelText: 'اسم المستخدم',
+                      ),
+                    ),
+                    TextField(
+                      controller: passwordController,
+                      decoration: const InputDecoration(
+                        labelText: 'كلمة المرور',
+                      ),
+                    ),
+                    DropdownButtonFormField<String>(
+                      initialValue: role,
+                      decoration: const InputDecoration(
+                        labelText: 'الدور',
+                      ),
+                      items: const [
+                        DropdownMenuItem(
+                          value: 'مدير',
+                          child: Text('مدير'),
+                        ),
+                        DropdownMenuItem(
+                          value: 'مستخدم',
+                          child: Text('مستخدم'),
+                        ),
+                      ],
+                      onChanged: (value) {
+                        if (value != null) {
+                          setDialogState(() {
+                            role = value;
+                          });
+                        }
+                      },
+                    ),
+                  ],
+                ),
+              ),
+              actions: [
+                TextButton(
+                  onPressed: () => Navigator.pop(dialogContext),
+                  child: const Text('إلغاء'),
+                ),
+                ElevatedButton(
+                  onPressed: () async {
+                    try {
+                      final name = nameController.text.trim();
+                      final username = usernameController.text.trim();
+                      final password = passwordController.text;
+
+                      await Supabase.instance.client
+                          .from('app_users')
+                          .update({
+                            'name': name,
+                            'username': username,
+                            'password': password,
+                            'role': role,
+                          })
+                          .eq('id', user.id);
+
+                      user.name = name;
+                      user.username = username;
+                      user.password = password;
+                      user.role = role;
+
+                      if (!mounted) return;
+
+                      Navigator.pop(dialogContext);
+                      setState(() {});
+
+                      ScaffoldMessenger.of(context).showSnackBar(
+                        const SnackBar(
+                          content: Text('تم تعديل المستخدم بنجاح'),
+                        ),
+                      );
+                    } catch (e) {
+                      if (!mounted) return;
+
+                      ScaffoldMessenger.of(context).showSnackBar(
+                        SnackBar(
+                          content: Text('حدث خطأ أثناء تعديل المستخدم: $e'),
+                        ),
+                      );
+                    }
+                  },
+                  child: const Text('حفظ التعديلات'),
+                ),
+              ],
+            );
+          },
+        );
+      },
+    );
+  }
+
+  void addUser() {
+    final nameController = TextEditingController();
+    final usernameController = TextEditingController();
+    final passwordController = TextEditingController();
+    String role = 'مستخدم';
+
+    showDialog(
+      context: context,
+      builder: (dialogContext) {
+        return StatefulBuilder(
+          builder: (context, setDialogState) {
+            return Directionality(
+              textDirection: TextDirection.rtl,
+              child: AlertDialog(
+                title: const Text('إضافة مستخدم جديد'),
+                content: SingleChildScrollView(
+                  child: Column(
+                    mainAxisSize: MainAxisSize.min,
+                    children: [
+                      TextField(
+                        controller: nameController,
+                        decoration: const InputDecoration(
+                          labelText: 'الاسم',
+                          prefixIcon: Icon(Icons.badge),
+                        ),
+                      ),
+                      const SizedBox(height: 12),
+                      TextField(
+                        controller: usernameController,
+                        decoration: const InputDecoration(
+                          labelText: 'اسم المستخدم',
+                          prefixIcon: Icon(Icons.person),
+                        ),
+                      ),
+                      const SizedBox(height: 12),
+                      TextField(
+                        controller: passwordController,
+                        obscureText: true,
+                        decoration: const InputDecoration(
+                          labelText: 'كلمة المرور',
+                          prefixIcon: Icon(Icons.lock),
+                        ),
+                      ),
+                      const SizedBox(height: 12),
+                      DropdownButtonFormField<String>(
+                        value: role,
+                        decoration: const InputDecoration(
+                          labelText: 'الصلاحية',
+                        ),
+                        items: const [
+                          DropdownMenuItem(
+                            value: 'مستخدم',
+                            child: Text('مستخدم'),
+                          ),
+                          DropdownMenuItem(
+                            value: 'مدير',
+                            child: Text('مدير'),
+                          ),
+                        ],
+                        onChanged: (value) {
+                          if (value != null) {
+                            setDialogState(() {
+                              role = value;
+                            });
+                          }
+                        },
+                      ),
+                    ],
+                  ),
+                ),
+                actions: [
+                  TextButton(
+                    onPressed: () {
+                      Navigator.pop(dialogContext);
+                    },
+                    child: const Text('إلغاء'),
+                  ),
+                  FilledButton(
+                    onPressed: () async {
+                      final name = nameController.text.trim();
+                      final username = usernameController.text.trim();
+                      final password = passwordController.text;
+
+                      if (name.isEmpty ||
+                          username.isEmpty ||
+                          password.isEmpty) {
+                        ScaffoldMessenger.of(context).showSnackBar(
+                          const SnackBar(
+                            content: Text('يرجى تعبئة جميع الحقول'),
+                          ),
+                        );
+                        return;
+                      }
+
+                      if (users.any((user) =>
+                          user.username.toLowerCase() ==
+                          username.toLowerCase())) {
+                        ScaffoldMessenger.of(context).showSnackBar(
+                          const SnackBar(
+                            content: Text('اسم المستخدم موجود مسبقًا'),
+                          ),
+                        );
+                        return;
+                      }
+
+                      setState(() {
+                        users.add(
+                          AppUser(
+                            username: username,
+                            password: password,
+                            name: name,
+                            role: role,
+                            active: true,
+                          ),
+                        );
+                      });
+
+                      await saveUsers();
+
+                      if (!mounted) return;
+
+                      Navigator.pop(dialogContext);
+
+                      ScaffoldMessenger.of(context).showSnackBar(
+                        SnackBar(
+                          content: Text(
+                            'تم إنشاء المستخدم $username بنجاح',
+                          ),
+                        ),
+                      );
+                    },
+                    child: const Text('إنشاء المستخدم'),
+                  ),
+                ],
+              ),
+            );
+          },
+        );
+      },
+    );
+  }
+
+  Future<void> deleteUser(int index) async {
+    if (users[index].username == 'admin') {
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(
+          content: Text('لا يمكن حذف مدير النظام الأساسي'),
+        ),
+      );
+      return;
+    }
+
+    setState(() {
+      users.removeAt(index);
+    });
+
+    await saveUsers();
+  }
+
+  void logout() {
+    Navigator.pushReplacement(
+      context,
+      MaterialPageRoute(
+        builder: (_) => const LoginPage(),
+      ),
+    );
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return Directionality(
+      textDirection: TextDirection.rtl,
+      child: Scaffold(
+        appBar: AppBar(
+          title: const Text(
+            'NetManager',
+            style: TextStyle(fontWeight: FontWeight.bold),
+          ),
+          actions: [
+            IconButton(
+              tooltip: 'تسجيل الخروج',
+              onPressed: logout,
+              icon: const Icon(Icons.logout),
+            ),
+          ],
+        ),
+        drawer: Drawer(
+          child: ListView(
+            padding: EdgeInsets.zero,
+            children: [
+              DrawerHeader(
+                decoration: BoxDecoration(
+                  color: Theme.of(context).colorScheme.primary,
+                ),
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    const Icon(
+                      Icons.router,
+                      color: Colors.white,
+                      size: 48,
+                    ),
+                    const SizedBox(height: 10),
+                    const Text(
+                      'NetManager',
+                      style: TextStyle(
+                        color: Colors.white,
+                        fontSize: 24,
+                        fontWeight: FontWeight.bold,
+                      ),
+                    ),
+                    Text(
+                      'مرحبًا، ${widget.currentUser.name}',
+                      style: const TextStyle(
+                        color: Colors.white70,
+                      ),
+                    ),
+                  ],
+                ),
+              ),
+              ListTile(
+                selected: selectedIndex == 0,
+                leading: const Icon(Icons.dashboard),
+                title: const Text('لوحة التحكم'),
+                onTap: () {
+                  setState(() {
+                    selectedIndex = 0;
+                  });
+                  Navigator.pop(context);
+                },
+              ),
+             if (widget.currentUser.role == 'مدير')
+  ListTile(
+    selected: selectedIndex == 1,
+    leading: const Icon(Icons.people),
+    title: const Text('المستخدمون'),
+    onTap: () {
+      setState(() {
+        selectedIndex = 1;
+      });
+      Navigator.pop(context);
+    },
+  ),
+              ListTile(
+                selected: selectedIndex == 2,
+                leading: const Icon(Icons.router),
+                title: const Text('أجهزة الشبكة'),
+                onTap: () {
+                  setState(() {
+                    selectedIndex = 2;
+                  });
+                  Navigator.pop(context);
+                },
+              ),
+              ListTile(
+                leading: const Icon(Icons.settings),
+                title: const Text('الإعدادات'),
+                onTap: () {},
+              ),
+            ],
+          ),
+        ),
+        body: selectedIndex == 0
+            ? buildDashboard()
+            : selectedIndex == 1
+                ? buildUsers()
+                : buildDevices(),
+        floatingActionButton: selectedIndex == 1 &&
+                widget.currentUser.role == 'مدير'
+            ? FloatingActionButton.extended(
+                onPressed: addUser,
+                icon: const Icon(Icons.person_add),
+                label: const Text('إضافة مستخدم'),
+              )
+            : selectedIndex == 2 &&
+                    widget.currentUser.role == 'مدير'
+                ? FloatingActionButton.extended(
+                    onPressed: addDevice,
+                    icon: const Icon(Icons.add),
+                    label: const Text('إضافة جهاز'),
+                  )
+                : null,
+      ),
+    );
+  }
+
+  Widget buildDashboard() {
+    return SingleChildScrollView(
+      padding: const EdgeInsets.all(20),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Text(
+            'مرحبًا ${widget.currentUser.name} 👋',
+            style: const TextStyle(
+              fontSize: 28,
+              fontWeight: FontWeight.bold,
+            ),
+          ),
+          const SizedBox(height: 8),
+          Text(
+            'لوحة إدارة شبكة الإنترنت',
+            style: TextStyle(
+              fontSize: 16,
+              color: Colors.grey.shade600,
+            ),
+          ),
+          const SizedBox(height: 25),
+          Wrap(
+            spacing: 15,
+            runSpacing: 15,
+            children: [
+              if (widget.currentUser.role == 'مدير') ...[
+  statCard(
+    'المستخدمون',
+    users.length.toString(),
+    Icons.people,
+  ),
+  statCard(
+    'المستخدمون النشطون',
+    users.where((u) => u.active).length.toString(),
+    Icons.check_circle,
+  ),
+],
+              statCard(
+                'أجهزة الشبكة',
+                devices.length.toString(),
+                Icons.router,
+              ),
+              statCard(
+                'الأجهزة النشطة',
+                devices.where((d) => d.active).length.toString(),
+                Icons.wifi,
+              ),
+              statCard(
+                'الأجهزة المتوقفة',
+                devices.where((d) => !d.active).length.toString(),
+                Icons.wifi_off,
+              ),
+            ],
+          ),
+        ],
+      ),
+    );
+  }
+
+  Widget statCard(
+    String title,
+    String value,
+    IconData icon,
+  ) {
+    return SizedBox(
+      width: 230,
+      child: Card(
+        child: Padding(
+          padding: const EdgeInsets.all(20),
+          child: Row(
+            children: [
+              CircleAvatar(
+                radius: 25,
+                child: Icon(icon),
+              ),
+              const SizedBox(width: 15),
+              Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  Text(
+                    title,
+                    style: TextStyle(
+                      color: Colors.grey.shade600,
+                    ),
+                  ),
+                  const SizedBox(height: 5),
+                  Text(
+                    value,
+                    style: const TextStyle(
+                      fontSize: 22,
+                      fontWeight: FontWeight.bold,
+                    ),
+                  ),
+                ],
+              ),
+            ],
+          ),
+        ),
+      ),
+    );
+  }
+
+  Future<void> addDevice() async {
+    final supabase = Supabase.instance.client;
+    final nameController = TextEditingController();
+    final ipController = TextEditingController();
+    String deviceType = 'راوتر';
+    bool active = true;
+    String? selectedUserId;
+
+    final result = await showDialog<bool>(
+      context: context,
+      builder: (context) {
+        return StatefulBuilder(
+          builder: (context, setDialogState) {
+            return AlertDialog(
+              title: const Text('إضافة جهاز شبكة'),
+              content: SingleChildScrollView(
+                child: Column(
+                  mainAxisSize: MainAxisSize.min,
+                  children: [
+                    TextField(
+                      controller: nameController,
+                      decoration: const InputDecoration(
+                        labelText: 'اسم الجهاز',
+                        prefixIcon: Icon(Icons.router),
+                      ),
+                    ),
+                    const SizedBox(height: 12),
+                    DropdownButtonFormField<String>(
+                      value: deviceType,
+                      decoration: const InputDecoration(
+                        labelText: 'نوع الجهاز',
+                        prefixIcon: Icon(Icons.device_hub),
+                      ),
+                      items: const [
+                        DropdownMenuItem(
+                          value: 'راوتر',
+                          child: Text('راوتر'),
+                        ),
+                        DropdownMenuItem(
+                          value: 'Access Point',
+                          child: Text('Access Point'),
+                        ),
+                        DropdownMenuItem(
+                          value: 'Switch',
+                          child: Text('Switch'),
+                        ),
+                      ],
+                      onChanged: (value) {
+                        if (value != null) {
+                          setDialogState(() {
+                            deviceType = value;
+                          });
+                        }
+                      },
+                    ),
+                    const SizedBox(height: 12),
+                    TextField(
+                      controller: ipController,
+                      keyboardType: TextInputType.url,
+                      decoration: const InputDecoration(
+                        labelText: 'عنوان IP',
+                        hintText: '192.168.1.1',
+                        prefixIcon: Icon(Icons.language),
+                      ),
+                    ),
+                    const SizedBox(height: 12),
+                    if (widget.currentUser.role == 'مدير')
+                      DropdownButtonFormField<String>(
+                        value: selectedUserId,
+                        decoration: const InputDecoration(
+                          labelText: 'المستخدم المسؤول عن الجهاز',
+                          prefixIcon: Icon(Icons.person),
+                        ),
+                        items: users
+                            .where((user) => user.role != 'مدير')
+                            .map(
+                              (user) => DropdownMenuItem<String>(
+                                value: user.id,
+                                child: Text(user.name),
+                              ),
+                            )
+                            .toList(),
+                        onChanged: (value) {
+                          setDialogState(() {
+                            selectedUserId = value;
+                          });
+                        },
+                      ),
+                    const SizedBox(height: 12),
+                    SwitchListTile(
+                      title: const Text('الجهاز نشط'),
+                      value: active,
+                      onChanged: (value) {
+                        setDialogState(() {
+                          active = value;
+                        });
+                      },
+                    ),
+                  ],
+                ),
+              ),
+              actions: [
+                TextButton(
+                  onPressed: () => Navigator.pop(context, false),
+                  child: const Text('إلغاء'),
+                ),
+                ElevatedButton(
+                  onPressed: () async {
+                    if (nameController.text.trim().isEmpty ||
+                        ipController.text.trim().isEmpty) {
+                      ScaffoldMessenger.of(context).showSnackBar(
+                        const SnackBar(
+                          content: Text('يرجى إدخال اسم الجهاز وعنوان IP'),
+                        ),
+                      );
+                      return;
+                    }
+
+                    try {
+                      await supabase.from('network_devices').insert({
+                        'name': nameController.text.trim(),
+                        'device_type': deviceType,
+                        'ip_address': ipController.text.trim(),
+                        'active': active,
+                        'user_id': widget.currentUser.role == 'مدير'
+                            ? selectedUserId
+                            : widget.currentUser.id,
+                      });
+
+                      if (context.mounted) {
+                        Navigator.pop(context, true);
+                      }
+                    } catch (e) {
+                      if (context.mounted) {
+                        ScaffoldMessenger.of(context).showSnackBar(
+                          SnackBar(
+                            content: Text('حدث خطأ أثناء إضافة الجهاز: $e'),
+                          ),
+                        );
+                      }
+                    }
+                  },
+                  child: const Text('حفظ'),
+                ),
+              ],
+            );
+          },
+        );
+      },
+    );
+
+    if (result == true) {
+      await loadDevices();
+      setState(() {});
+    }
+  }
+
+
+
+  Future<void> toggleDeviceStatus(NetworkDevice device) async {
+    try {
+      await Supabase.instance.client
+          .from('network_devices')
+          .update({
+            'active': !device.active,
+          })
+          .eq('id', device.id);
+
+      await loadDevices();
+
+      if (!mounted) return;
+
+      setState(() {});
+
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(
+          content: Text(
+            device.active
+                ? 'تم إيقاف الجهاز'
+                : 'تم تفعيل الجهاز',
+          ),
+        ),
+      );
+    } catch (e) {
+      if (!mounted) return;
+
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(
+          content: Text('حدث خطأ أثناء تغيير الحالة: $e'),
+        ),
+      );
+    }
+  }
+
+  Future<void> editDevice(NetworkDevice device) async {
+    final nameController = TextEditingController(text: device.name);
+    final ipController = TextEditingController(text: device.ipAddress);
+    String type = device.deviceType;
+
+    await showDialog(
+      context: context,
+      builder: (dialogContext) {
+        return StatefulBuilder(
+          builder: (context, setDialogState) {
+            return Directionality(
+              textDirection: TextDirection.rtl,
+              child: AlertDialog(
+                title: const Text('تعديل جهاز الشبكة'),
+                content: SingleChildScrollView(
+                  child: Column(
+                    mainAxisSize: MainAxisSize.min,
+                    children: [
+                      TextField(
+                        controller: nameController,
+                        decoration: const InputDecoration(
+                          labelText: 'اسم الجهاز',
+                          prefixIcon: Icon(Icons.devices),
+                        ),
+                      ),
+                      const SizedBox(height: 12),
+                      TextField(
+                        controller: ipController,
+                        decoration: const InputDecoration(
+                          labelText: 'عنوان IP',
+                          prefixIcon: Icon(Icons.language),
+                        ),
+                      ),
+                      const SizedBox(height: 12),
+                      DropdownButtonFormField<String>(
+                        initialValue: type,
+                        decoration: const InputDecoration(
+                          labelText: 'نوع الجهاز',
+                        ),
+                        items: const [
+                          DropdownMenuItem(
+                            value: 'راوتر',
+                            child: Text('راوتر'),
+                          ),
+                          DropdownMenuItem(
+                            value: 'سويتش',
+                            child: Text('سويتش'),
+                          ),
+                        ],
+                        onChanged: (value) {
+                          if (value != null) {
+                            setDialogState(() {
+                              type = value;
+                            });
+                          }
+                        },
+                      ),
+                    ],
+                  ),
+                ),
+                actions: [
+                  TextButton(
+                    onPressed: () {
+                      Navigator.pop(dialogContext);
+                    },
+                    child: const Text('إلغاء'),
+                  ),
+                  FilledButton(
+                    onPressed: () async {
+                      final name = nameController.text.trim();
+                      final ip = ipController.text.trim();
+
+                      if (name.isEmpty || ip.isEmpty) {
+                        return;
+                      }
+
+                      try {
+                        await Supabase.instance.client
+                            .from('network_devices')
+                            .update({
+                              'name': name,
+                              'device_type': type,
+                              'ip_address': ip,
+                            })
+                            .eq('id', device.id);
+
+                        await loadDevices();
+
+                        if (!mounted) return;
+
+                        setState(() {});
+                        Navigator.pop(dialogContext);
+
+                        ScaffoldMessenger.of(context).showSnackBar(
+                          const SnackBar(
+                            content: Text('تم تعديل الجهاز بنجاح'),
+                          ),
+                        );
+                      } catch (e) {
+                        if (!mounted) return;
+
+                        ScaffoldMessenger.of(context).showSnackBar(
+                          SnackBar(
+                            content: Text('حدث خطأ أثناء التعديل: $e'),
+                          ),
+                        );
+                      }
+                    },
+                    child: const Text('حفظ التعديلات'),
+                  ),
+                ],
+              ),
+            );
+          },
+        );
+      },
+    );
+
+    nameController.dispose();
+    ipController.dispose();
+  }
+
+  Future<void> deleteDevice(NetworkDevice device) async {
+    try {
+      await Supabase.instance.client
+          .from('network_devices')
+          .delete()
+          .eq('id', device.id);
+
+      await loadDevices();
+
+      if (!mounted) return;
+
+      setState(() {});
+
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(
+          content: Text('تم حذف الجهاز بنجاح'),
+        ),
+      );
+    } catch (e) {
+      if (!mounted) return;
+
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(
+          content: Text('حدث خطأ أثناء الحذف: $e'),
+        ),
+      );
+    }
+  }
+
+  Widget buildDevices() {
+    return Padding(
+      padding: const EdgeInsets.all(20),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          const Text(
+            'أجهزة الشبكة',
+            style: TextStyle(
+              fontSize: 28,
+              fontWeight: FontWeight.bold,
+            ),
+          ),
+          const SizedBox(height: 8),
+          Text(
+            'إدارة أجهزة الشبكة المتصلة',
+            style: TextStyle(
+              color: Colors.grey,
+            ),
+          ),
+          const SizedBox(height: 20),
+          Expanded(
+            child: devices.isEmpty
+                ? const Center(
+                    child: Text('لا توجد أجهزة شبكة'),
+                  )
+                : ListView.builder(
+                    itemCount: devices.length,
+                    itemBuilder: (context, index) {
+                      final device = devices[index];
+
+                      return Card(
+                        child: ListTile(
+                          leading: CircleAvatar(
+                            child: Icon(
+                              device.deviceType == 'راوتر'
+                                  ? Icons.router
+                                  : Icons.device_hub,
+                            ),
+                          ),
+                          title: Text(device.name),
+                          subtitle: Text(
+                            '${device.deviceType} • ${device.ipAddress}',
+                          ),
+                          trailing: Row(
+                            mainAxisSize: MainAxisSize.min,
+                            children: [
+                              ActionChip(
+                                avatar: Icon(
+                                  device.active
+                                      ? Icons.check_circle
+                                      : Icons.cancel,
+                                ),
+                                label: Text(
+                                  device.active ? 'نشط' : 'متوقف',
+                                ),
+                                tooltip: 'اضغط لتغيير حالة الجهاز',
+                                onPressed: () {
+                                  toggleDeviceStatus(device);
+                                },
+                              ),
+                              IconButton(
+                                tooltip: 'فحص الاتصال',
+                                icon: Icon(
+                                  device.isOnline
+                                      ? Icons.wifi
+                                      : Icons.wifi_off,
+                                ),
+                                onPressed: () {
+                                  checkDeviceStatus(device);
+                                },
+                              ),
+                              IconButton(
+                                tooltip: 'تعديل الجهاز',
+                                icon: const Icon(Icons.edit),
+                                onPressed: () {
+                                  editDevice(device);
+                                },
+                              ),
+                              IconButton(
+                                tooltip: 'حذف الجهاز',
+                                icon: const Icon(Icons.delete),
+                                onPressed: () {
+                                  deleteDevice(device);
+                                },
+                              ),
+                            ],
+                          ),
+                        ),
+                      );
+                    },
+                  ),
+          ),
+        ],
+      ),
+    );
+  }
+
+  Widget buildUsers() {
+    return Padding(
+      padding: const EdgeInsets.all(20),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          const Text(
+            'المستخدمون',
+            style: TextStyle(
+              fontSize: 28,
+              fontWeight: FontWeight.bold,
+            ),
+          ),
+          const SizedBox(height: 20),
+          Expanded(
+            child: ListView.builder(
+              itemCount: users.length,
+              itemBuilder: (context, index) {
+                final user = users[index];
+
+                return Card(
+                  child: ListTile(
+                    leading: CircleAvatar(
+                      child: Icon(
+                        user.role == 'مدير'
+                            ? Icons.admin_panel_settings
+                            : Icons.person,
+                      ),
+                    ),
+                    title: Text(user.name),
+                    subtitle: Text(
+                      '@${user.username} • ${user.role}',
+                    ),
+                    trailing: Row(
+                      mainAxisSize: MainAxisSize.min,
+                      children: [
+                        ActionChip(
+                          avatar: Icon(
+                            user.active
+                                ? Icons.check_circle
+                                : Icons.cancel,
+                          ),
+                          label: Text(
+                            user.active ? 'نشط' : 'متوقف',
+                          ),
+                          tooltip: 'اضغط لتغيير حالة المستخدم',
+                          onPressed: () {
+                            toggleUserStatus(user);
+                          },
+                        ),
+                        IconButton(
+                          tooltip: 'تعديل المستخدم',
+                          onPressed: () {
+                            editUser(user);
+                          },
+                          icon: const Icon(Icons.edit),
+                        ),
+                        IconButton(
+                          tooltip: 'حذف',
+                          onPressed: () {
+                            deleteUser(index);
+                          },
+                          icon: const Icon(Icons.delete),
+                        ),
+                      ],
+                    ),
+                  ),
+                );
+              },
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+}

@@ -1,0 +1,71 @@
+import 'package:flutter/material.dart';
+
+import 'app_update_service.dart';
+
+Future<void> showNetManagerUpdateDialog(
+  BuildContext context,
+  AppUpdateInfo update,
+) async {
+  await showDialog<void>(
+    context: context,
+    barrierDismissible: !update.isMandatory,
+    builder: (dialogContext) {
+      return PopScope(
+        canPop: !update.isMandatory,
+        child: AlertDialog(
+          title: const Row(
+            children: [
+              Icon(Icons.system_update, color: Colors.green),
+              SizedBox(width: 10),
+              Expanded(child: Text('تحديث جديد لـ NetManager')),
+            ],
+          ),
+          content: Column(
+            mainAxisSize: MainAxisSize.min,
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              Text(
+                'الإصدار الجديد: ${update.versionName}',
+                style: const TextStyle(fontWeight: FontWeight.bold),
+              ),
+              const SizedBox(height: 12),
+              Text(
+                update.releaseNotes.isEmpty
+                    ? 'يتوفر إصدار جديد من التطبيق.'
+                    : update.releaseNotes,
+              ),
+              if (update.isMandatory) ...[
+                const SizedBox(height: 12),
+                const Text(
+                  'هذا التحديث مطلوب للاستمرار باستخدام التطبيق.',
+                  style: TextStyle(color: Colors.red),
+                ),
+              ],
+            ],
+          ),
+          actions: [
+            if (!update.isMandatory)
+              TextButton(
+                onPressed: () => Navigator.pop(dialogContext),
+                child: const Text('لاحقًا'),
+              ),
+            FilledButton.icon(
+              onPressed: () {
+                Navigator.pop(dialogContext);
+                ScaffoldMessenger.of(context).showSnackBar(
+                  const SnackBar(
+                    content: Text(
+                      'تم اكتشاف التحديث. سيتم تفعيل التنزيل بعد إكمال فحوصات الأمان.',
+                    ),
+                  ),
+                );
+              },
+              icon: const Icon(Icons.download),
+              label: const Text('تحديث الآن'),
+            ),
+          ],
+        ),
+      );
+    },
+  );
+}

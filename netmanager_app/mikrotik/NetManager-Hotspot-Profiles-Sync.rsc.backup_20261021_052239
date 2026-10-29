@@ -1,0 +1,85 @@
+# NetManager Hotspot Profiles Sync
+# RouterOS 7
+# Read-only synchronization
+
+:global netmanagerToken
+
+:local url "https://wimfoaxolomefwuikywn.supabase.co/functions/v1/rapid-worker"
+
+:if ([:typeof $netmanagerToken] != "str") do={
+    :error "NetManager token missing"
+}
+
+:if ([:len $netmanagerToken] != 64) do={
+    :error "Invalid NetManager token"
+}
+
+:local headers ("Content-Type: application/json,X-MikroTik-Token: " . $netmanagerToken)
+
+:local startResult [/tool fetch url=$url http-method=post http-header-field=$headers http-data="{\"action\":\"profiles_start\"}" output=user as-value]
+
+:local startData [:deserialize from=json value=($startResult->"data")]
+
+:if (($startData->"status") != "started") do={
+    :error "Unable to start profile synchronization"
+}
+
+:local runId ($startData->"run_id")
+
+:if ([:len $runId] != 36) do={
+    :error "Invalid synchronization ID"
+}
+
+:local profileNames [/ip hotspot user profile find]
+:local expectedCount [:len $profileNames]
+:local sentCount 0
+
+:foreach id in=$profileNames do={
+
+    :local profileName [/ip hotspot user profile get $id name]
+    :local rateLimit [/ip hotspot user profile get $id rate-limit]
+    :local sharedUsers [/ip hotspot user profile get $id shared-users]
+
+    :local profileData {
+        "action"="profiles_account";
+        "run_id"=$runId;
+        "mikrotik_profile_id"=$profileName;
+        "name"=$profileName;
+        "rate_limit"=$rateLimit;
+        "shared_users"=$sharedUsers
+    }
+
+    :local jsonData [:serialize to=json value=$profileData]
+
+    :local result [/tool fetch url=$url http-method=post http-header-field=$headers http-data=$jsonData output=user as-value]
+
+    :local response [:deserialize from=json value=($result->"data")]
+
+    :if (($response->"status") != "saved") do={
+        :error "Hotspot profile synchronization failed"
+    }
+
+    :set sentCount ($sentCount + 1)
+}
+
+:if ($sentCount != $expectedCount) do={
+    :error "Profile count mismatch"
+}
+
+:local finishData {
+    "action"="profiles_finish";
+    "run_id"=$runId;
+    "expected_count"=$expectedCount
+}
+
+:local finishJson [:serialize to=json value=$finishData]
+
+:local finishResult [/tool fetch url=$url http-method=post http-header-field=$headers http-data=$finishJson output=user as-value]
+
+:local finishResponse [:deserialize from=json value=($finishResult->"data")]
+
+:if (($finishResponse->"status") != "completed") do={
+    :error "Unable to finish profile synchronization"
+}
+
+:log info ("NetManager Hotspot profiles sync completed: " . $sentCount . " profiles")

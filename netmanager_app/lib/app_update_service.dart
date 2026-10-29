@@ -1,0 +1,64 @@
+import 'package:flutter/foundation.dart';
+import 'package:package_info_plus/package_info_plus.dart';
+import 'package:supabase_flutter/supabase_flutter.dart';
+
+class AppUpdateInfo {
+  final int versionCode;
+  final String versionName;
+  final String apkUrl;
+  final String apkSha256;
+  final String releaseNotes;
+  final bool isMandatory;
+
+  const AppUpdateInfo({
+    required this.versionCode,
+    required this.versionName,
+    required this.apkUrl,
+    required this.apkSha256,
+    required this.releaseNotes,
+    required this.isMandatory,
+  });
+}
+
+class AppUpdateService {
+  static bool get isSupported =>
+      !kIsWeb && defaultTargetPlatform == TargetPlatform.android;
+
+  static Future<AppUpdateInfo?> checkForUpdate() async {
+    if (!isSupported) return null;
+
+    final packageInfo = await PackageInfo.fromPlatform();
+    final currentVersionCode = int.tryParse(packageInfo.buildNumber) ?? 0;
+
+    final response = await Supabase.instance.client
+        .from('app_updates')
+        .select(
+          'version_code, version_name, apk_url, '
+          'release_notes, is_mandatory, apk_sha256',
+        )
+        .eq('active', true)
+        .gt('version_code', currentVersionCode)
+        .order('version_code', ascending: false)
+        .limit(1);
+
+    if (response.isEmpty) return null;
+
+    final data = response.first;
+
+    final url = (data['apk_url'] ?? '').toString().trim();
+    final uri = Uri.tryParse(url);
+
+    if (uri == null || uri.scheme != 'https' || uri.host.isEmpty) {
+      throw const FormatException('رابط تحديث التطبيق غير صالح أو غير آمن');
+    }
+
+    return AppUpdateInfo(
+      versionCode: (data['version_code'] as num).toInt(),
+      versionName: (data['version_name'] ?? '').toString(),
+      apkUrl: url,
+      apkSha256: (data['apk_sha256'] ?? '').toString(),
+      releaseNotes: (data['release_notes'] ?? '').toString(),
+      isMandatory: data['is_mandatory'] == true,
+    );
+  }
+}

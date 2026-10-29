@@ -1,0 +1,3725 @@
+========== SALES INVOICE ==========
+  Future<void> openAccountingSalesInvoicePage({
+    Map<String, dynamic>? existingSale,cd ؤيؤي
+    final isArabic = widget.currentUser.language == 'ar';
+
+    try {
+      final customersData = await Supabase.instance.client
+          .from('accounting_customers')
+          .select()
+          .eq('created_by', widget.currentUser.id)
+          .eq('active', true)
+          .order('name');
+
+      final salesData = await Supabase.instance.client
+          .from('accounting_sales')
+          .select('invoice_number')
+          .eq('created_by', widget.currentUser.id)
+          .order('invoice_number', ascending: false)
+          .limit(1);
+
+      final productsData = await Supabase.instance.client
+          .from('accounting_products')
+          .select()
+          .eq('created_by', widget.currentUser.id)
+          .eq('active', true)
+          .order('name');
+
+      if (!mounted) return;
+
+      final customers = List<Map<String, dynamic>>.from(customersData);
+      final products = List<Map<String, dynamic>>.from(productsData);
+
+      int nextInvoiceNumber = 1;
+
+      if (salesData.isNotEmpty) {
+        final lastNumber =
+            (salesData.first['invoice_number'] as num?)?.toInt() ?? 0;
+        nextInvoiceNumber = lastNumber + 1;
+      }
+
+      final customerSearchController = TextEditingController();
+
+      Map<String, dynamic>? selectedCustomer;
+      List<Map<String, dynamic>> filteredCustomers = [];
+
+      double previousBalanceUsd = 0;
+      double previousBalanceSyp = 0;
+      bool searchingCustomer = false;
+      bool initialEditBalanceLoaded = false;
+
+      final invoiceItems = <Map<String, dynamic>>[];
+      bool savingInvoice = false;
+
+      final invoiceDiscountUsdController = TextEditingController(text: '0');
+      final invoiceDiscountSypController = TextEditingController(text: '0');
+      final paidUsdController = TextEditingController(text: '0');
+      final paidSypController = TextEditingController(text: '0');
+
+      final isEditingSale = existingSale != null;
+
+      if (isEditingSale) {
+        final saleId = existingSale['id']?.toString();
+
+        if (saleId == null || saleId.isEmpty) {
+          throw Exception(
+            isArabic ? 'معرّف الفاتورة غير موجود' : 'Invoice ID is missing',
+          );
+        }
+
+        final customerId = existingSale['customer_id']?.toString();
+
+        if (customerId != null && customerId.isNotEmpty) {
+          for (final customer in customers) {
+            if (customer['id']?.toString() == customerId) {
+              selectedCustomer = customer;
+              customerSearchController.text =
+                  customer['name']?.toString() ?? '';
+              searchingCustomer = true;
+              break;
+            }
+          }
+        }
+
+        paidUsdController.text =
+            ((existingSale['paid_usd'] as num?)?.toDouble() ?? 0)
+                .toStringAsFixed(2);
+
+        paidSypController.text =
+            ((existingSale['paid_syp'] as num?)?.toDouble() ?? 0)
+                .toStringAsFixed(0);
+
+        final savedItemsData = await Supabase.instance.client
+            .from('accounting_sale_items')
+            .select()
+            .eq('sale_id', saleId);
+
+        final savedItems = List<Map<String, dynamic>>.from(savedItemsData);
+
+        for (final savedItem in savedItems) {
+          final productId = savedItem['product_id']?.toString();
+
+          Map<String, dynamic>? product;
+
+          for (final item in products) {
+            if (item['id']?.toString() == productId) {
+              product = item;
+              break;
+            }
+          }
+
+          if (product == null) {
+            continue;
+          }
+
+          invoiceItems.add({
+            'product': product,
+            'searchController': TextEditingController(
+              text: product['name']?.toString() ?? '',
+            ),
+            'quantityController': TextEditingController(
+              text: ((savedItem['quantity'] as num?)?.toDouble() ?? 0)
+                  .toString(),
+            ),
+            'priceController': TextEditingController(
+              text: ((savedItem['unit_price'] as num?)?.toDouble() ?? 0)
+                  .toString(),
+            ),
+            'discountController': TextEditingController(
+              text: ((savedItem['discount'] as num?)?.toDouble() ?? 0)
+                  .toString(),
+            ),
+            'priceCurrency': savedItem['currency']?.toString() ?? 'USD',
+            'filteredProducts': <Map<String, dynamic>>[],
+          });
+        }
+      }
+
+      Map<String, dynamic> createEmptyInvoiceRow() {
+        return {
+          'product': null,
+          'searchController': TextEditingController(),
+          'quantityController': TextEditingController(text: '1'),
+          'priceController': TextEditingController(),
+          'discountController': TextEditingController(text: '0'),
+          'priceCurrency': 'USD',
+          'filteredProducts': <Map<String, dynamic>>[],
+        };
+      }
+
+      double rowTotal(Map<String, dynamic> row) {
+        final quantity =
+            double.tryParse(row['quantityController'].text.trim()) ?? 0;
+
+        final price = double.tryParse(row['priceController'].text.trim()) ?? 0;
+
+        var discount =
+            double.tryParse(row['discountController'].text.trim()) ?? 0;
+
+        if (discount < 0) discount = 0;
+        if (discount > 100) discount = 100;
+
+        final beforeDiscount = quantity * price;
+
+        return beforeDiscount * (1 - discount / 100);
+      }
+
+      double invoiceItemsTotal(String currency) {
+        double total = 0;
+
+        for (final row in invoiceItems) {
+          if (row['product'] == null) continue;
+
+          final rowCurrency = row['priceCurrency']?.toString() ?? 'USD';
+
+          if (rowCurrency == currency) {
+            total += rowTotal(row);
+          }
+        }
+
+        return total;
+      }
+
+      double invoiceDiscountPercent(TextEditingController controller) {
+        var value = double.tryParse(controller.text.trim()) ?? 0;
+
+        if (value < 0) value = 0;
+        if (value > 100) value = 100;
+
+        return value;
+      }
+
+      double invoiceNetTotal(
+        String currency,
+        TextEditingController discountController,
+      ) {
+        final total = invoiceItemsTotal(currency);
+        final discount = invoiceDiscountPercent(discountController);
+
+        return total * (1 - discount / 100);
+      }
+
+      await showDialog<void>(
+        context: context,
+        barrierDismissible: false,
+        builder: (dialogContext) {
+          return StatefulBuilder(
+            builder: (context, setDialogState) {
+              Future<void> selectCustomer(Map<String, dynamic> customer) async {
+                setDialogState(() {
+                  selectedCustomer = customer;
+                  customerSearchController.text =
+                      customer['name']?.toString() ?? '';
+                  filteredCustomers = [];
+                  searchingCustomer = true;
+                });
+
+                try {
+                  final customerId = customer['id'].toString();
+
+                  final transactions = await Supabase.instance.client
+                      .from('accounting_transactions')
+                      .select()
+                      .eq('customer_id', customerId);
+
+                  final sales = await Supabase.instance.client
+                      .from('accounting_sales')
+                      .select()
+                      .eq('created_by', widget.currentUser.id)
+                      .eq('customer_id', customerId);
+
+                  final openingBalance =
+                      (customer['opening_balance'] as num?)?.toDouble() ?? 0;
+
+                  final customerCurrency =
+                      customer['currency']?.toString() ?? 'USD';
+
+                  double balanceUsd = customerCurrency == 'USD'
+                      ? openingBalance
+                      : 0;
+
+                  double balanceSyp = customerCurrency == 'SYP'
+                      ? openingBalance
+                      : 0;
+
+                  final editingSaleId = existingSale?['id']?.toString();
+
+                  for (final sale in sales) {
+                    if (sale['status']?.toString() == 'cancelled') {
+                      continue;
+                    }
+
+                    // عند تعديل فاتورة لا نحسب نفس الفاتورة
+                    // ضمن الرصيد السابق.
+                    if (editingSaleId != null &&
+                        sale['id']?.toString() == editingSaleId) {
+                      continue;
+                    }
+
+                    final totalUsd =
+                        (sale['total_usd'] as num?)?.toDouble() ?? 0;
+
+                    final totalSyp =
+                        (sale['total_syp'] as num?)?.toDouble() ?? 0;
+
+                    final paidUsd = (sale['paid_usd'] as num?)?.toDouble() ?? 0;
+
+                    final paidSyp = (sale['paid_syp'] as num?)?.toDouble() ?? 0;
+
+                    balanceUsd += totalUsd - paidUsd;
+                    balanceSyp += totalSyp - paidSyp;
+                  }
+
+                  // الحركات القديمة ما زالت مرتبطة بعملة واحدة.
+                  // نطبقها على عملة العميل فقط حتى لا نخلط العملات.
+                  for (final transaction in transactions) {
+                    final type = transaction['transaction_type']?.toString();
+
+                    final amount =
+                        (transaction['amount'] as num?)?.toDouble() ?? 0;
+
+                    double effect = 0;
+
+                    if (type == 'customer_receipt') {
+                      effect = -amount;
+                    } else if (type == 'customer_payment') {
+                      effect = amount;
+                    } else {
+                      continue;
+                    }
+
+                    if (customerCurrency == 'SYP') {
+                      balanceSyp += effect;
+                    } else {
+                      balanceUsd += effect;
+                    }
+                  }
+
+                  if (!dialogContext.mounted) return;
+
+                  setDialogState(() {
+                    previousBalanceUsd = balanceUsd;
+                    previousBalanceSyp = balanceSyp;
+                    searchingCustomer = false;
+                  });
+                } catch (e) {
+                  if (!dialogContext.mounted) return;
+
+                  setDialogState(() {
+                    searchingCustomer = false;
+                  });
+
+                  ScaffoldMessenger.of(context).showSnackBar(
+                    SnackBar(
+                      content: Text(
+                        isArabic ? 'تعذر تحديث رصيد العميل، حاول مرة أخرى' : 'Unable to update customer balance. Please try again.',
+                      ),
+                    ),
+                  );
+                }
+              }
+
+              if (isEditingSale &&
+                  selectedCustomer != null &&
+                  !initialEditBalanceLoaded) {
+                initialEditBalanceLoaded = true;
+
+                WidgetsBinding.instance.addPostFrameCallback((_) {
+                  if (!dialogContext.mounted) return;
+                  selectCustomer(selectedCustomer!);
+                });
+              }
+
+              Future<void> openInvoiceItemEditor({
+                Map<String, dynamic>? existingRow,
+              }) async {
+                final isEditing = existingRow != null;
+
+                Map<String, dynamic>? selectedProduct =
+                    existingRow?['product'] as Map<String, dynamic>?;
+
+                final searchController = TextEditingController(
+                  text: selectedProduct?['name']?.toString() ?? '',
+                );
+
+                final quantityController = TextEditingController(
+                  text: existingRow?['quantityController']?.text ?? '1',
+                );
+
+                final priceController = TextEditingController(
+                  text: existingRow?['priceController']?.text ?? '',
+                );
+
+                final discountController = TextEditingController(
+                  text: existingRow?['discountController']?.text ?? '0',
+                );
+
+                String priceCurrency =
+                    existingRow?['priceCurrency']?.toString() ?? 'USD';
+
+                List<Map<String, dynamic>> filteredProducts = [];
+
+                bool saved = false;
+
+                await showDialog<void>(
+                  context: context,
+                  builder: (itemDialogContext) {
+                    return StatefulBuilder(
+                      builder: (context, setItemState) {
+                        double currentTotal() {
+                          final quantity =
+                              double.tryParse(quantityController.text.trim()) ??
+                              0;
+
+                          final price =
+                              double.tryParse(priceController.text.trim()) ?? 0;
+
+                          var discount =
+                              double.tryParse(discountController.text.trim()) ??
+                              0;
+
+                          if (discount < 0) discount = 0;
+                          if (discount > 100) discount = 100;
+
+                          return quantity * price * (1 - discount / 100);
+                        }
+
+                        void convertPriceExpression(String value) {
+                          final expression = value.trim().replaceAll('×', '*');
+                          final parts = expression.split('*');
+
+                          if (parts.length != 2) {
+                            setItemState(() {});
+                            return;
+                          }
+
+                          final usd = double.tryParse(parts[0].trim());
+                          final rate = double.tryParse(parts[1].trim());
+
+                          if (usd == null || rate == null || rate <= 0) {
+                            setItemState(() {});
+                            return;
+                          }
+
+                          final converted = usd * rate;
+
+                          setItemState(() {
+                            priceController.text = converted.toStringAsFixed(0);
+
+                            priceController.selection = TextSelection.collapsed(
+                              offset: priceController.text.length,
+                            );
+
+                            priceCurrency = 'SYP';
+                          });
+                        }
+
+                        void saveItem() {
+                          if (selectedProduct == null) {
+                            ScaffoldMessenger.of(context).showSnackBar(
+                              SnackBar(
+                                content: Text(
+                                  isArabic
+                                      ? 'اختر المادة أولاً'
+                                      : 'Select a product first',
+                                ),
+                              ),
+                            );
+                            return;
+                          }
+
+                          final quantity =
+                              double.tryParse(quantityController.text.trim()) ??
+                              0;
+
+                          final price =
+                              double.tryParse(priceController.text.trim()) ?? 0;
+
+                          var discount =
+                              double.tryParse(discountController.text.trim()) ??
+                              0;
+
+                          final stock =
+                              (selectedProduct?['quantity'] as num?)
+                                  ?.toDouble() ??
+                              0;
+
+                          if (quantity <= 0) {
+                            ScaffoldMessenger.of(context).showSnackBar(
+                              SnackBar(
+                                content: Text(
+                                  isArabic
+                                      ? 'أدخل كمية صحيحة'
+                                      : 'Enter a valid quantity',
+                                ),
+                              ),
+                            );
+                            return;
+                          }
+
+                          if (quantity > stock) {
+                            ScaffoldMessenger.of(context).showSnackBar(
+                              SnackBar(
+                                content: Text(
+                                  isArabic
+                                      ? 'الكمية المطلوبة أكبر من المخزون المتوفر'
+                                      : 'Requested quantity exceeds available stock',
+                                ),
+                              ),
+                            );
+                            return;
+                          }
+
+                          if (price < 0) {
+                            ScaffoldMessenger.of(context).showSnackBar(
+                              SnackBar(
+                                content: Text(
+                                  isArabic ? 'السعر غير صحيح' : 'Invalid price',
+                                ),
+                              ),
+                            );
+                            return;
+                          }
+
+                          if (discount < 0) discount = 0;
+                          if (discount > 100) discount = 100;
+
+                          discountController.text = discount.toStringAsFixed(
+                            discount % 1 == 0 ? 0 : 2,
+                          );
+
+                          final newRow = <String, dynamic>{
+                            'product': selectedProduct,
+                            'searchController': TextEditingController(
+                              text: selectedProduct?['name']?.toString() ?? '',
+                            ),
+                            'quantityController': TextEditingController(
+                              text: quantityController.text.trim(),
+                            ),
+                            'priceController': TextEditingController(
+                              text: priceController.text.trim(),
+                            ),
+                            'discountController': TextEditingController(
+                              text: discountController.text.trim(),
+                            ),
+                            'priceCurrency': priceCurrency,
+                            'filteredProducts': <Map<String, dynamic>>[],
+                          };
+
+                          setDialogState(() {
+                            if (isEditing) {
+                              final index = invoiceItems.indexOf(existingRow);
+
+                              if (index >= 0) {
+                                invoiceItems[index] = newRow;
+                              }
+                            } else {
+                              invoiceItems.add(newRow);
+                            }
+                          });
+
+                          saved = true;
+                          Navigator.of(itemDialogContext).pop();
+                        }
+
+                        final stock =
+                            (selectedProduct?['quantity'] as num?)
+                                ?.toDouble() ??
+                            0;
+
+                        final quantity =
+                            double.tryParse(quantityController.text.trim()) ??
+                            0;
+
+                        return AlertDialog(
+                          title: Row(
+                            children: [
+                              const Icon(Icons.inventory_2_outlined),
+                              const SizedBox(width: 8),
+                              Expanded(
+                                child: Text(
+                                  isEditing
+                                      ? (isArabic ? 'تعديل مادة' : 'Edit Item')
+                                      : (isArabic
+                                            ? 'إضافة مادة للفاتورة'
+                                            : 'Add Invoice Item'),
+                                ),
+                              ),
+                            ],
+                          ),
+                          content: SizedBox(
+                            width: 560,
+                            child: SingleChildScrollView(
+                              child: Column(
+                                mainAxisSize: MainAxisSize.min,
+                                children: [
+                                  TextField(
+                                    controller: searchController,
+                                    autofocus: !isEditing,
+                                    decoration: InputDecoration(
+                                      labelText: isArabic
+                                          ? 'المادة'
+                                          : 'Product',
+                                      hintText: isArabic
+                                          ? 'اكتب اسم أو كود المادة'
+                                          : 'Search name or code',
+                                      prefixIcon: const Icon(Icons.search),
+                                      border: const OutlineInputBorder(),
+                                    ),
+                                    onChanged: (value) {
+                                      final query = value.trim().toLowerCase();
+
+                                      setItemState(() {
+                                        selectedProduct = null;
+
+                                        if (query.isEmpty) {
+                                          filteredProducts = [];
+                                        } else {
+                                          filteredProducts = products
+                                              .where((p) {
+                                                final name =
+                                                    p['name']
+                                                        ?.toString()
+                                                        .toLowerCase() ??
+                                                    '';
+
+                                                final code =
+                                                    p['code']
+                                                        ?.toString()
+                                                        .toLowerCase() ??
+                                                    '';
+
+                                                return name.contains(query) ||
+                                                    code.contains(query);
+                                              })
+                                              .take(8)
+                                              .toList();
+                                        }
+                                      });
+                                    },
+                                    onSubmitted: (_) {
+                                      if (selectedProduct != null) {
+                                        saveItem();
+                                      }
+                                    },
+                                  ),
+
+                                  if (selectedProduct == null &&
+                                      filteredProducts.isNotEmpty)
+                                    Container(
+                                      margin: const EdgeInsets.only(top: 4),
+                                      constraints: const BoxConstraints(
+                                        maxHeight: 220,
+                                      ),
+                                      decoration: BoxDecoration(
+                                        border: Border.all(
+                                          color: Theme.of(context).dividerColor,
+                                        ),
+                                        borderRadius: BorderRadius.circular(8),
+                                      ),
+                                      child: ListView(
+                                        shrinkWrap: true,
+                                        children: filteredProducts.map((p) {
+                                          final pStock =
+                                              (p['quantity'] as num?)
+                                                  ?.toDouble() ??
+                                              0;
+
+                                          return ListTile(
+                                            dense: true,
+                                            leading: const Icon(
+                                              Icons.inventory_2_outlined,
+                                            ),
+                                            title: Text(
+                                              p['name']?.toString() ?? '-',
+                                            ),
+                                            subtitle: Text(
+                                              '${isArabic ? 'الكود' : 'Code'}: ${p['code']?.toString() ?? '-'}   •   ${isArabic ? 'المخزون' : 'Stock'}: ${pStock.toStringAsFixed(2)}',
+                                            ),
+                                            onTap: () {
+                                              setItemState(() {
+                                                selectedProduct = p;
+
+                                                searchController.text =
+                                                    p['name']?.toString() ?? '';
+
+                                                priceController.text =
+                                                    ((p['sale_price'] as num?)
+                                                                ?.toDouble() ??
+                                                            0)
+                                                        .toStringAsFixed(2);
+
+                                                priceCurrency = 'USD';
+                                                filteredProducts = [];
+                                              });
+                                            },
+                                          );
+                                        }).toList(),
+                                      ),
+                                    ),
+
+                                  if (selectedProduct != null) ...[
+                                    const SizedBox(height: 8),
+                                    Align(
+                                      alignment:
+                                          AlignmentDirectional.centerStart,
+                                      child: Text(
+                                        '${isArabic ? 'المتوفر' : 'Available'}: ${stock.toStringAsFixed(2)} ${selectedProduct?['unit']?.toString() ?? ''}',
+                                      ),
+                                    ),
+                                  ],
+
+                                  const SizedBox(height: 14),
+
+                                  Wrap(
+                                    spacing: 10,
+                                    runSpacing: 10,
+                                    children: [
+                                      SizedBox(
+                                        width: 120,
+                                        child: TextField(
+                                          controller: quantityController,
+                                          keyboardType:
+                                              const TextInputType.numberWithOptions(
+                                                decimal: true,
+                                              ),
+                                          decoration: InputDecoration(
+                                            labelText: isArabic
+                                                ? 'الكمية'
+                                                : 'Qty',
+                                            border: const OutlineInputBorder(),
+                                          ),
+                                          onChanged: (_) {
+                                            setItemState(() {});
+                                          },
+                                          onSubmitted: (_) => saveItem(),
+                                        ),
+                                      ),
+                                      SizedBox(
+                                        width: 170,
+                                        child: TextField(
+                                          controller: priceController,
+                                          keyboardType: TextInputType.text,
+                                          textInputAction: TextInputAction.done,
+                                          decoration: InputDecoration(
+                                            labelText: isArabic
+                                                ? 'السعر'
+                                                : 'Price',
+                                            hintText: '5*13000',
+                                            suffixText: priceCurrency,
+                                            border: const OutlineInputBorder(),
+                                          ),
+                                          onChanged: (_) {
+                                            setItemState(() {
+                                              priceCurrency = 'USD';
+                                            });
+                                          },
+                                          onSubmitted: convertPriceExpression,
+                                        ),
+                                      ),
+                                      SizedBox(
+                                        width: 120,
+                                        child: TextField(
+                                          controller: discountController,
+                                          keyboardType:
+                                              const TextInputType.numberWithOptions(
+                                                decimal: true,
+                                              ),
+                                          decoration: InputDecoration(
+                                            labelText: isArabic
+                                                ? 'الحسم %'
+                                                : 'Discount %',
+                                            suffixText: '%',
+                                            border: const OutlineInputBorder(),
+                                          ),
+                                          onChanged: (_) {
+                                            setItemState(() {});
+                                          },
+                                          onSubmitted: (_) => saveItem(),
+                                        ),
+                                      ),
+                                    ],
+                                  ),
+
+                                  if (selectedProduct != null &&
+                                      quantity > stock) ...[
+                                    const SizedBox(height: 8),
+                                    Align(
+                                      alignment:
+                                          AlignmentDirectional.centerStart,
+                                      child: Text(
+                                        isArabic
+                                            ? '⚠ الكمية المطلوبة أكبر من المخزون المتوفر'
+                                            : '⚠ Requested quantity exceeds available stock',
+                                        style: TextStyle(
+                                          color: Theme.of(context)
+                                              .colorScheme
+                                              .error,
+                                          fontWeight: FontWeight.bold,
+                                        ),
+                                      ),
+                                    ),
+                                  ],
+
+                                  const SizedBox(height: 14),
+
+                                  Container(
+                                    width: double.infinity,
+                                    padding: const EdgeInsets.all(12),
+                                    decoration: BoxDecoration(
+                                      color: Theme.of(context)
+                                          .colorScheme
+                                          .surfaceContainerHighest,
+                                      borderRadius: BorderRadius.circular(8),
+                                    ),
+                                    child: Text(
+                                      priceCurrency == 'SYP'
+                                          ? '${isArabic ? 'الإجمالي' : 'Total'}: ${currentTotal().toStringAsFixed(0)} SYP'
+                                          : '${isArabic ? 'الإجمالي' : 'Total'}: ${currentTotal().toStringAsFixed(2)} USD',
+                                      textAlign: TextAlign.center,
+                                      style: const TextStyle(
+                                        fontSize: 17,
+                                        fontWeight: FontWeight.bold,
+                                      ),
+                                    ),
+                                  ),
+                                ],
+                              ),
+                            ),
+                          ),
+                          actions: [
+                            TextButton(
+                              onPressed: () =>
+                                  Navigator.of(itemDialogContext).pop(),
+                              child: Text(isArabic ? 'إلغاء' : 'Cancel'),
+                            ),
+                            FilledButton.icon(
+                              onPressed: saveItem,
+                              icon: Icon(isEditing ? Icons.save : Icons.add),
+                              label: Text(
+                                isEditing
+                                    ? (isArabic ? 'حفظ' : 'Save')
+                                    : (isArabic ? 'إضافة' : 'Add'),
+                              ),
+                            ),
+                          ],
+                        );
+                      },
+                    );
+                  },
+                );
+
+                if (!saved) return;
+              }
+
+              Future<void> saveAccountingSalesInvoice() async {
+                if (savingInvoice) return;
+
+                if (selectedCustomer == null) {
+                  ScaffoldMessenger.of(context).showSnackBar(
+                    SnackBar(
+                      content: Text(
+                        isArabic
+                            ? 'اختر العميل أولاً'
+                            : 'Select a customer first',
+                      ),
+                    ),
+                  );
+                  return;
+                }
+
+                final validItems = invoiceItems.where((row) {
+                  return row['product'] != null;
+                }).toList();
+
+                if (validItems.isEmpty) {
+                  ScaffoldMessenger.of(context).showSnackBar(
+                    SnackBar(
+                      content: Text(
+                        isArabic
+                            ? 'أضف مادة واحدة على الأقل إلى الفاتورة'
+                            : 'Add at least one invoice item',
+                      ),
+                    ),
+                  );
+                  return;
+                }
+
+                for (final row in validItems) {
+                  final product = row['product'] as Map<String, dynamic>?;
+
+                  if (product == null) continue;
+
+                  final quantity =
+                      double.tryParse(row['quantityController'].text.trim()) ??
+                      0;
+
+                  final stock = (product['quantity'] as num?)?.toDouble() ?? 0;
+
+                  if (quantity <= 0) {
+                    ScaffoldMessenger.of(context).showSnackBar(
+                      SnackBar(
+                        content: Text(
+                          isArabic
+                              ? 'توجد مادة بكمية غير صحيحة'
+                              : 'An item has an invalid quantity',
+                        ),
+                      ),
+                    );
+                    return;
+                  }
+
+                  if (quantity > stock) {
+                    ScaffoldMessenger.of(context).showSnackBar(
+                      SnackBar(
+                        content: Text(
+                          isArabic
+                              ? 'الكمية المطلوبة للمادة ${product['name'] ?? ''} أكبر من المخزون'
+                              : 'Requested quantity for ${product['name'] ?? ''} exceeds stock',
+                        ),
+                      ),
+                    );
+                    return;
+                  }
+                }
+
+                setDialogState(() {
+                  savingInvoice = true;
+                });
+
+                String? createdSaleId;
+
+                try {
+                  final usdTotal = invoiceItemsTotal('USD');
+                  final sypTotal = invoiceItemsTotal('SYP');
+
+                  final hasUsd = validItems.any(
+                    (row) =>
+                        (row['priceCurrency']?.toString() ?? 'USD') == 'USD',
+                  );
+
+                  final hasSyp = validItems.any(
+                    (row) =>
+                        (row['priceCurrency']?.toString() ?? 'USD') == 'SYP',
+                  );
+
+                  final legacyCurrency = hasSyp && !hasUsd ? 'SYP' : 'USD';
+
+                  final legacyTotal = legacyCurrency == 'SYP'
+                      ? sypTotal
+                      : usdTotal;
+
+                  final paidUsd =
+                      (double.tryParse(paidUsdController.text.trim()) ?? 0)
+                          .clamp(0, double.infinity);
+
+                  final paidSyp =
+                      (double.tryParse(paidSypController.text.trim()) ?? 0)
+                          .clamp(0, double.infinity);
+
+                  final saleData = <String, dynamic>{
+                    'customer_id': selectedCustomer!['id'],
+                    'subtotal': legacyTotal,
+                    'discount': 0,
+                    'total': legacyTotal,
+                    'paid_amount': 0,
+                    'currency': legacyCurrency,
+                    'subtotal_usd': usdTotal,
+                    'subtotal_syp': sypTotal,
+                    'discount_usd': 0,
+                    'discount_syp': 0,
+                    'total_usd': usdTotal,
+                    'total_syp': sypTotal,
+                    'paid_usd': paidUsd,
+                    'paid_syp': paidSyp,
+                    'status': 'posted',
+                  };
+
+                  String saleId;
+                  dynamic invoiceNumber;
+
+                  if (isEditingSale) {
+                    final existingSaleId = existingSale['id']?.toString();
+
+                    if (existingSaleId == null || existingSaleId.isEmpty) {
+                      throw Exception(
+                        isArabic
+                            ? 'معرّف الفاتورة غير موجود'
+                            : 'Invoice ID is missing',
+                      );
+                    }
+
+                    // نحافظ على تاريخ ورقم الفاتورة الأصليين.
+                    final updatedSale = await Supabase.instance.client
+                        .from('accounting_sales')
+                        .update(saleData)
+                        .eq('id', existingSaleId)
+                        .select('id, invoice_number')
+                        .single();
+
+                    saleId = updatedSale['id'].toString();
+                    invoiceNumber = updatedSale['invoice_number'];
+
+                    // استبدال بنود الفاتورة القديمة بالبنود المعدلة.
+                    await Supabase.instance.client
+                        .from('accounting_sale_items')
+                        .delete()
+                        .eq('sale_id', saleId);
+                  } else {
+                    saleData['invoice_date'] = DateTime.now().toIso8601String();
+
+                    saleData['created_by'] = widget.currentUser.id;
+
+                    final createdSale = await Supabase.instance.client
+                        .from('accounting_sales')
+                        .insert(saleData)
+                        .select('id, invoice_number')
+                        .single();
+
+                    createdSaleId = createdSale['id']?.toString();
+
+                    if (createdSaleId == null || createdSaleId.isEmpty) {
+                      throw Exception(
+                        isArabic
+                            ? 'لم يتم إرجاع رقم الفاتورة المحفوظة'
+                            : 'Saved invoice ID was not returned',
+                      );
+                    }
+
+                    saleId = createdSaleId;
+                    invoiceNumber = createdSale['invoice_number'];
+                  }
+
+                  final itemRows = <Map<String, dynamic>>[];
+
+                  for (final row in validItems) {
+                    final product = row['product'] as Map<String, dynamic>;
+
+                    final quantity =
+                        double.tryParse(
+                          row['quantityController'].text.trim(),
+                        ) ??
+                        0;
+
+                    final unitPrice =
+                        double.tryParse(row['priceController'].text.trim()) ??
+                        0;
+
+                    var discountPercent =
+                        double.tryParse(
+                          row['discountController'].text.trim(),
+                        ) ??
+                        0;
+
+                    if (discountPercent < 0) {
+                      discountPercent = 0;
+                    }
+
+                    if (discountPercent > 100) {
+                      discountPercent = 100;
+                    }
+
+                    final unitCost =
+                        (product['purchase_price'] as num?)?.toDouble() ?? 0;
+
+                    final currency = row['priceCurrency']?.toString() ?? 'USD';
+
+                    itemRows.add({
+                      'sale_id': saleId,
+                      'product_id': product['id'],
+                      'quantity': quantity,
+                      'unit_price': unitPrice,
+                      'unit_cost': unitCost,
+                      'discount': discountPercent,
+                      'total': rowTotal(row),
+                      'currency': currency,
+                    });
+                  }
+
+                  await Supabase.instance.client
+                      .from('accounting_sale_items')
+                      .insert(itemRows);
+
+                  // المرحلة الأولى:
+                  // عند إنشاء فاتورة جديدة فقط، نخصم الكميات من المخزون
+                  // ونسجل حركة sale مرتبطة بمعرّف الفاتورة.
+                  if (!isEditingSale) {
+                    for (final row in validItems) {
+                      final product = row['product'] as Map<String, dynamic>;
+
+                      final productId = product['id']?.toString() ?? '';
+
+                      final quantity =
+                          double.tryParse(
+                            row['quantityController'].text.trim(),
+                          ) ??
+                          0;
+
+                      if (productId.isEmpty || quantity <= 0) {
+                        continue;
+                      }
+
+                      // نقرأ الكمية الحالية مباشرة من قاعدة البيانات
+                      // قبل الخصم، ولا نعتمد فقط على القائمة المحلية.
+                      final freshProduct = await Supabase.instance.client
+                          .from('accounting_products')
+                          .select('quantity')
+                          .eq('id', productId)
+                          .single();
+
+                      final quantityBefore =
+                          (freshProduct['quantity'] as num?)?.toDouble() ?? 0;
+
+                      final quantityAfter = quantityBefore - quantity;
+
+                      if (quantityAfter < 0) {
+                        throw Exception(
+                          isArabic
+                              ? 'الكمية المطلوبة للمادة ${product['name'] ?? ''} أكبر من المخزون'
+                              : 'Requested quantity for ${product['name'] ?? ''} exceeds stock',
+                        );
+                      }
+
+                      await Supabase.instance.client
+                          .from('accounting_products')
+                          .update({
+                            'quantity': quantityAfter,
+                            'updated_at': DateTime.now().toIso8601String(),
+                          })
+                          .eq('id', productId);
+
+                      try {
+                        await Supabase.instance.client
+                            .from('accounting_inventory_movements')
+                            .insert({
+                              'product_id': productId,
+                              'movement_type': 'sale',
+                              'quantity': quantity,
+                              'quantity_before': quantityBefore,
+                              'quantity_after': quantityAfter,
+                              'reference_id': saleId,
+                              'notes': isArabic
+                                  ? 'بيع - فاتورة رقم $invoiceNumber'
+                                  : 'Sale - Invoice $invoiceNumber',
+                              'movement_date': DateTime.now().toIso8601String(),
+                              'created_by': widget.currentUser.id,
+                            });
+                      } catch (_) {
+                        // إذا فشل تسجيل حركة المخزون،
+                        // نعيد كمية هذه المادة كما كانت.
+                        await Supabase.instance.client
+                            .from('accounting_products')
+                            .update({
+                              'quantity': quantityBefore,
+                              'updated_at': DateTime.now().toIso8601String(),
+                            })
+                            .eq('id', productId);
+
+                        rethrow;
+                      }
+
+                      // تحديث النسخة المحلية أيضًا.
+                      product['quantity'] = quantityAfter;
+                    }
+                  }
+
+                  await loadAccountingSales();
+
+                  if (!mounted) return;
+
+                  Navigator.of(dialogContext).pop();
+
+                  ScaffoldMessenger.of(context).showSnackBar(
+                    SnackBar(
+                      content: Text(
+                        isEditingSale
+                            ? (isArabic
+                                  ? 'تم تعديل فاتورة المبيعات رقم $invoiceNumber بنجاح'
+                                  : 'Sales invoice $invoiceNumber updated successfully')
+                            : (isArabic
+                                  ? 'تم حفظ فاتورة المبيعات رقم $invoiceNumber بنجاح'
+                                  : 'Sales invoice $invoiceNumber saved successfully'),
+                      ),
+                    ),
+                  );
+                } catch (e) {
+                  // الحذف التلقائي هنا خاص فقط بالفاتورة الجديدة.
+                  // لا نحذف فاتورة قديمة عند فشل تعديلها.
+                  if (!isEditingSale && createdSaleId != null) {
+                    try {
+                      await Supabase.instance.client
+                          .from('accounting_sales')
+                          .delete()
+                          .eq('id', createdSaleId);
+                    } catch (_) {}
+                  }
+
+                  if (!mounted) return;
+
+                  setDialogState(() {
+                    savingInvoice = false;
+                  });
+
+                  ScaffoldMessenger.of(context).showSnackBar(
+                    SnackBar(
+                      content: Text(
+                        isArabic
+                            ? 'تعذر حفظ الفاتورة: $e'
+                            : 'Unable to save invoice: $e',
+                      ),
+                    ),
+                  );
+                }
+              }
+
+              Future<void> deleteAccountingSalesInvoice() async {
+                if (!isEditingSale || savingInvoice) return;
+
+                final saleId = existingSale['id']?.toString();
+
+                if (saleId == null || saleId.isEmpty) {
+                  ScaffoldMessenger.of(context).showSnackBar(
+                    SnackBar(
+                      content: Text(
+                        isArabic
+                            ? 'معرّف الفاتورة غير موجود'
+                            : 'Invoice ID is missing',
+                      ),
+                    ),
+                  );
+                  return;
+                }
+
+                final invoiceNumber =
+                    existingSale['invoice_number']?.toString() ?? '';
+
+                final confirmed = await showDialog<bool>(
+                  context: dialogContext,
+                  builder: (confirmContext) {
+                    return AlertDialog(
+                      title: Text(isArabic ? 'حذف الفاتورة' : 'Delete Invoice'),
+                      content: Text(
+                        isArabic
+                            ? 'هل أنت متأكد من حذف فاتورة المبيعات رقم $invoiceNumber؟\n\nلا يمكن التراجع عن الحذف.'
+                            : 'Are you sure you want to delete sales invoice $invoiceNumber?\n\nThis action cannot be undone.',
+                      ),
+                      actions: [
+                        TextButton(
+                          onPressed: () {
+                            Navigator.of(confirmContext).pop(false);
+                          },
+                          child: Text(isArabic ? 'إلغاء' : 'Cancel'),
+                        ),
+                        FilledButton.icon(
+                          onPressed: () {
+                            Navigator.of(confirmContext).pop(true);
+                          },
+                          icon: const Icon(Icons.delete_outline),
+                          label: Text(isArabic ? 'حذف' : 'Delete'),
+                        ),
+                      ],
+                    );
+                  },
+                );
+
+                if (confirmed != true) return;
+
+                setDialogState(() {
+                  savingInvoice = true;
+                });
+
+                try {
+                  // حذف بنود الفاتورة أولاً.
+                  await Supabase.instance.client
+                      .from('accounting_sale_items')
+                      .delete()
+                      .eq('sale_id', saleId);
+
+                  // ثم حذف رأس الفاتورة.
+                  await Supabase.instance.client
+                      .from('accounting_sales')
+                      .delete()
+                      .eq('id', saleId);
+
+                  await loadAccountingSales();
+
+                  if (!dialogContext.mounted) return;
+
+                  Navigator.of(dialogContext).pop();
+
+                  if (!mounted) return;
+
+                  ScaffoldMessenger.of(context).showSnackBar(
+                    SnackBar(
+                      content: Text(
+                        isArabic
+                            ? 'تم حذف فاتورة المبيعات رقم $invoiceNumber بنجاح'
+                            : 'Sales invoice $invoiceNumber deleted successfully',
+                      ),
+                    ),
+                  );
+                } catch (e) {
+                  if (!dialogContext.mounted) return;
+
+                  setDialogState(() {
+                    savingInvoice = false;
+                  });
+
+                  ScaffoldMessenger.of(context).showSnackBar(
+                    SnackBar(
+                      content: Text(
+                        isArabic
+                            ? 'تعذر حذف الفاتورة'
+                            : 'Unable to delete invoice',
+                      ),
+                    ),
+                  );
+                }
+              }
+
+              return Dialog(
+                insetPadding: const EdgeInsets.all(20),
+                child: ConstrainedBox(
+                  constraints: const BoxConstraints(
+                    maxWidth: 1100,
+                    maxHeight: 850,
+                  ),
+                  child: Column(
+                    children: [
+                      Container(
+                        width: double.infinity,
+                        padding: const EdgeInsets.all(24),
+                        child: Row(
+                          crossAxisAlignment: CrossAxisAlignment.start,
+                          children: [
+                            Container(
+                              width: 72,
+                              height: 72,
+                              decoration: BoxDecoration(
+                                borderRadius: BorderRadius.circular(12),
+                                color: Theme.of(context)
+                                    .colorScheme
+                                    .primaryContainer,
+                              ),
+                              child: Icon(
+                                Icons.business,
+                                size: 38,
+                                color: Theme.of(context).colorScheme.primary,
+                              ),
+                            ),
+                            const SizedBox(width: 16),
+                            Expanded(
+                              child: Column(
+                                crossAxisAlignment: CrossAxisAlignment.start,
+                                children: [
+                                  Text(
+                                    isArabic
+                                        ? 'بيانات الشركة'
+                                        : 'Company Information',
+                                    style: const TextStyle(
+                                      fontSize: 18,
+                                      fontWeight: FontWeight.bold,
+                                    ),
+                                  ),
+                                  const SizedBox(height: 5),
+                                  Text(
+                                    isArabic
+                                        ? 'سيتم ربط اسم الشركة والشعار وبياناتها من الإعدادات'
+                                        : 'Company name, logo and details will be linked from settings',
+                                  ),
+                                ],
+                              ),
+                            ),
+                            Column(
+                              crossAxisAlignment: CrossAxisAlignment.end,
+                              children: [
+                                Text(
+                                  isArabic ? 'فاتورة مبيعات' : 'SALES INVOICE',
+                                  style: const TextStyle(
+                                    fontSize: 26,
+                                    fontWeight: FontWeight.bold,
+                                  ),
+                                ),
+                                const SizedBox(height: 8),
+                                Text(
+                                  '${isArabic ? 'رقم الفاتورة' : 'Invoice No.'}: $nextInvoiceNumber',
+                                  style: const TextStyle(
+                                    fontWeight: FontWeight.bold,
+                                  ),
+                                ),
+                                const SizedBox(height: 4),
+                                Text(
+                                  '${isArabic ? 'التاريخ' : 'Date'}: '
+                                  '${DateTime.now().year}-'
+                                  '${DateTime.now().month.toString().padLeft(2, '0')}-'
+                                  '${DateTime.now().day.toString().padLeft(2, '0')}',
+                                ),
+                              ],
+                            ),
+                          ],
+                        ),
+                      ),
+
+                      const Divider(height: 1),
+
+                      Expanded(
+                        child: SingleChildScrollView(
+                          padding: const EdgeInsets.all(24),
+                          child: Column(
+                            crossAxisAlignment: CrossAxisAlignment.stretch,
+                            children: [
+                              Text(
+                                isArabic
+                                    ? 'بيانات العميل'
+                                    : 'Customer Information',
+                                style: const TextStyle(
+                                  fontSize: 18,
+                                  fontWeight: FontWeight.bold,
+                                ),
+                              ),
+                              const SizedBox(height: 14),
+
+                              if (selectedCustomer == null)
+                                TextField(
+                                  controller: customerSearchController,
+                                  decoration: InputDecoration(
+                                    labelText: isArabic
+                                        ? 'اسم العميل'
+                                        : 'Customer Name',
+                                    hintText: isArabic
+                                        ? 'ابدأ بكتابة اسم العميل للبحث...'
+                                        : 'Start typing customer name...',
+                                    prefixIcon: const Icon(Icons.search),
+                                    border: const OutlineInputBorder(),
+                                    suffixIcon: selectedCustomer == null
+                                        ? null
+                                        : IconButton(
+                                            icon: const Icon(Icons.clear),
+                                            onPressed: () {
+                                              setDialogState(() {
+                                                selectedCustomer = null;
+                                                previousBalanceUsd = 0;
+                                                previousBalanceSyp = 0;
+                                                customerSearchController
+                                                    .clear();
+                                                filteredCustomers = [];
+                                              });
+                                            },
+                                          ),
+                                  ),
+                                  onChanged: (value) {
+                                    final query = value.trim().toLowerCase();
+
+                                    setDialogState(() {
+                                      selectedCustomer = null;
+                                      previousBalanceUsd = 0;
+                                      previousBalanceSyp = 0;
+
+                                      if (query.isEmpty) {
+                                        filteredCustomers = [];
+                                      } else {
+                                        filteredCustomers = customers
+                                            .where((customer) {
+                                              final name =
+                                                  customer['name']
+                                                      ?.toString()
+                                                      .toLowerCase() ??
+                                                  '';
+
+                                              final phone =
+                                                  customer['phone']
+                                                      ?.toString()
+                                                      .toLowerCase() ??
+                                                  '';
+
+                                              return name.contains(query) ||
+                                                  phone.contains(query);
+                                            })
+                                            .take(8)
+                                            .toList();
+                                      }
+                                    });
+                                  },
+                                ),
+
+                              if (selectedCustomer == null &&
+                                  filteredCustomers.isNotEmpty)
+                                Container(
+                                  margin: const EdgeInsets.only(top: 4),
+                                  decoration: BoxDecoration(
+                                    border: Border.all(
+                                      color: Theme.of(context).dividerColor,
+                                    ),
+                                    borderRadius: BorderRadius.circular(8),
+                                  ),
+                                  child: Column(
+                                    children: filteredCustomers.map((customer) {
+                                      return ListTile(
+                                        leading: const Icon(
+                                          Icons.person_outline,
+                                        ),
+                                        title: Text(
+                                          customer['name']?.toString() ?? '-',
+                                        ),
+                                        subtitle: customer['phone'] == null
+                                            ? null
+                                            : Text(
+                                                customer['phone'].toString(),
+                                              ),
+                                        onTap: () {
+                                          selectCustomer(customer);
+                                        },
+                                      );
+                                    }).toList(),
+                                  ),
+                                ),
+
+                              const SizedBox(height: 16),
+
+                              if (selectedCustomer != null)
+                                Card(
+                                  clipBehavior: Clip.antiAlias,
+                                  child: InkWell(
+                                    onTap: () {
+                                      final oldName =
+                                          selectedCustomer?['name']
+                                              ?.toString() ??
+                                          '';
+
+                                      setDialogState(() {
+                                        selectedCustomer = null;
+                                        previousBalanceUsd = 0;
+                                        previousBalanceSyp = 0;
+                                        searchingCustomer = false;
+                                        filteredCustomers = [];
+
+                                        customerSearchController.text = oldName;
+                                      });
+                                    },
+                                    child: Padding(
+                                      padding: const EdgeInsets.all(16),
+                                      child: Row(
+                                        children: [
+                                          const Icon(Icons.person, size: 32),
+                                          const SizedBox(width: 12),
+                                          Expanded(
+                                            child: Column(
+                                              crossAxisAlignment:
+                                                  CrossAxisAlignment.start,
+                                              children: [
+                                                Text(
+                                                  selectedCustomer!['name']
+                                                          ?.toString() ??
+                                                      '-',
+                                                  style: const TextStyle(
+                                                    fontSize: 17,
+                                                    fontWeight: FontWeight.bold,
+                                                  ),
+                                                ),
+                                                if (selectedCustomer!['phone'] !=
+                                                    null)
+                                                  Text(
+                                                    selectedCustomer!['phone']
+                                                        .toString(),
+                                                  ),
+                                              ],
+                                            ),
+                                          ),
+                                          searchingCustomer
+                                              ? const SizedBox(
+                                                  width: 24,
+                                                  height: 24,
+                                                  child:
+                                                      CircularProgressIndicator(
+                                                        strokeWidth: 2,
+                                                      ),
+                                                )
+                                              : Column(
+                                                  crossAxisAlignment:
+                                                      CrossAxisAlignment.end,
+                                                  children: [
+                                                    Text(
+                                                      isArabic
+                                                          ? 'الرصيد السابق'
+                                                          : 'Previous Balance',
+                                                    ),
+                                                    Text(
+                                                      '${previousBalanceUsd.toStringAsFixed(2)} USD',
+                                                      style: const TextStyle(
+                                                        fontSize: 16,
+                                                        fontWeight:
+                                                            FontWeight.bold,
+                                                      ),
+                                                    ),
+                                                    Text(
+                                                      '${previousBalanceSyp.toStringAsFixed(0)} SYP',
+                                                      style: const TextStyle(
+                                                        fontSize: 16,
+                                                        fontWeight:
+                                                            FontWeight.bold,
+                                                      ),
+                                                    ),
+                                                  ],
+                                                ),
+                                        ],
+                                      ),
+                                    ),
+                                  ),
+                                ),
+
+                              const SizedBox(height: 30),
+
+                              Container(
+                                width: double.infinity,
+                                padding: const EdgeInsets.all(12),
+                                margin: const EdgeInsets.only(bottom: 12),
+                                decoration: BoxDecoration(
+                                  color: Theme.of(context)
+                                      .colorScheme
+                                      .primaryContainer,
+                                  borderRadius: BorderRadius.circular(10),
+                                ),
+                                child: Text(
+                                  isArabic
+                                      ? 'مواد الفاتورة'
+                                      : '▼ INVOICE ITEMS ▼',
+                                  textAlign: TextAlign.center,
+                                  style: const TextStyle(
+                                    fontSize: 20,
+                                    fontWeight: FontWeight.bold,
+                                  ),
+                                ),
+                              ),
+
+                              Container(
+                                padding: const EdgeInsets.all(16),
+                                decoration: BoxDecoration(
+                                  border: Border.all(
+                                    color: Theme.of(context).dividerColor,
+                                  ),
+                                  borderRadius: BorderRadius.circular(12),
+                                ),
+                                child: Column(
+                                  crossAxisAlignment:
+                                      CrossAxisAlignment.stretch,
+                                  children: [
+                                    Row(
+                                      children: [
+                                        const Icon(Icons.inventory_2_outlined),
+                                        const SizedBox(width: 8),
+                                        Expanded(
+                                          child: Text(
+                                            isArabic
+                                                ? 'مواد الفاتورة'
+                                                : 'Invoice Items',
+                                            style: const TextStyle(
+                                              fontSize: 18,
+                                              fontWeight: FontWeight.bold,
+                                            ),
+                                          ),
+                                        ),
+                                        FilledButton.icon(
+                                          onPressed: () async {
+                                            await openInvoiceItemEditor();
+                                          },
+                                          icon: const Icon(Icons.add),
+                                          label: Text(
+                                            isArabic
+                                                ? 'إضافة مادة'
+                                                : 'Add Item',
+                                          ),
+                                        ),
+                                      ],
+                                    ),
+                                    const SizedBox(height: 16),
+
+                                    if (invoiceItems.isNotEmpty) ...[
+                                      Container(
+                                        padding: const EdgeInsets.symmetric(
+                                          horizontal: 10,
+                                          vertical: 8,
+                                        ),
+                                        decoration: BoxDecoration(
+                                          color: Theme.of(context)
+                                              .colorScheme
+                                              .surfaceContainerHighest,
+                                          borderRadius: BorderRadius.circular(
+                                            8,
+                                          ),
+                                        ),
+                                        child: Row(
+                                          children: [
+                                            Expanded(
+                                              flex: 3,
+                                              child: Text(
+                                                isArabic ? 'المادة' : 'Product',
+                                                style: const TextStyle(
+                                                  fontSize: 12,
+                                                  fontWeight: FontWeight.bold,
+                                                ),
+                                              ),
+                                            ),
+                                            Expanded(
+                                              flex: 5,
+                                              child: Row(
+                                                children: [
+                                                  Expanded(
+                                                    child: Text(
+                                                      isArabic
+                                                          ? 'الكمية'
+                                                          : 'Qty',
+                                                      textAlign:
+                                                          TextAlign.center,
+                                                      style: const TextStyle(
+                                                        fontSize: 12,
+                                                        fontWeight:
+                                                            FontWeight.bold,
+                                                      ),
+                                                    ),
+                                                  ),
+                                                  Expanded(
+                                                    flex: 2,
+                                                    child: Text(
+                                                      isArabic
+                                                          ? 'السعر'
+                                                          : 'Price',
+                                                      textAlign:
+                                                          TextAlign.center,
+                                                      style: const TextStyle(
+                                                        fontSize: 12,
+                                                        fontWeight:
+                                                            FontWeight.bold,
+                                                      ),
+                                                    ),
+                                                  ),
+                                                  Expanded(
+                                                    child: Text(
+                                                      isArabic
+                                                          ? 'الحسم'
+                                                          : 'Disc.',
+                                                      textAlign:
+                                                          TextAlign.center,
+                                                      style: const TextStyle(
+                                                        fontSize: 12,
+                                                        fontWeight:
+                                                            FontWeight.bold,
+                                                      ),
+                                                    ),
+                                                  ),
+                                                  Expanded(
+                                                    flex: 2,
+                                                    child: Text(
+                                                      isArabic
+                                                          ? 'الإجمالي'
+                                                          : 'Total',
+                                                      textAlign:
+                                                          TextAlign.center,
+                                                      style: const TextStyle(
+                                                        fontSize: 12,
+                                                        fontWeight:
+                                                            FontWeight.bold,
+                                                      ),
+                                                    ),
+                                                  ),
+                                                ],
+                                              ),
+                                            ),
+                                            const SizedBox(width: 96),
+                                          ],
+                                        ),
+                                      ),
+                                      const SizedBox(height: 4),
+                                    ],
+
+                                    if (invoiceItems.isEmpty)
+                                      Container(
+                                        width: double.infinity,
+                                        padding: const EdgeInsets.symmetric(
+                                          vertical: 18,
+                                          horizontal: 12,
+                                        ),
+                                        decoration: BoxDecoration(
+                                          color: Theme.of(context)
+                                              .colorScheme
+                                              .surfaceContainerLowest,
+                                          borderRadius: BorderRadius.circular(
+                                            8,
+                                          ),
+                                        ),
+                                        child: Column(
+                                          children: [
+                                            Icon(
+                                              Icons.shopping_cart_outlined,
+                                              size: 30,
+                                              color: Theme.of(context)
+                                                  .colorScheme
+                                                  .onSurfaceVariant,
+                                            ),
+                                            const SizedBox(height: 6),
+                                            Text(
+                                              isArabic
+                                                  ? 'لم تتم إضافة مواد إلى الفاتورة'
+                                                  : 'No invoice items added',
+                                              textAlign: TextAlign.center,
+                                            ),
+                                          ],
+                                        ),
+                                      )
+                                    else
+                                      ...List.generate(invoiceItems.length, (
+                                        index,
+                                      ) {
+                                        final row = invoiceItems[index];
+
+                                        final product =
+                                            row['product']
+                                                as Map<String, dynamic>?;
+
+                                        if (product == null) {
+                                          return const SizedBox.shrink();
+                                        }
+
+                                        final quantity =
+                                            double.tryParse(
+                                              row['quantityController'].text
+                                                  .trim(),
+                                            ) ??
+                                            0;
+
+                                        final price =
+                                            double.tryParse(
+                                              row['priceController'].text
+                                                  .trim(),
+                                            ) ??
+                                            0;
+
+                                        var discount =
+                                            double.tryParse(
+                                              row['discountController'].text
+                                                  .trim(),
+                                            ) ??
+                                            0;
+
+                                        if (discount < 0) discount = 0;
+                                        if (discount > 100) discount = 100;
+
+                                        final currency =
+                                            row['priceCurrency']?.toString() ??
+                                            'USD';
+
+                                        final total = rowTotal(row);
+
+                                        final stock =
+                                            (product['quantity'] as num?)
+                                                ?.toDouble() ??
+                                            0;
+
+                                        final unit =
+                                            product['unit']?.toString() ?? '';
+
+                                        final name =
+                                            product['name']?.toString() ?? '-';
+
+                                        final code =
+                                            product['code']?.toString() ?? '';
+
+                                        final quantityText = quantity
+                                            .toStringAsFixed(
+                                              quantity % 1 == 0 ? 0 : 2,
+                                            );
+
+                                        final priceText = currency == 'SYP'
+                                            ? price.toStringAsFixed(0)
+                                            : price.toStringAsFixed(2);
+
+                                        final totalText = currency == 'SYP'
+                                            ? total.toStringAsFixed(0)
+                                            : total.toStringAsFixed(2);
+
+                                        return Card(
+                                          margin: const EdgeInsets.only(
+                                            bottom: 6,
+                                          ),
+                                          child: Padding(
+                                            padding: const EdgeInsets.symmetric(
+                                              horizontal: 10,
+                                              vertical: 8,
+                                            ),
+                                            child: Row(
+                                              children: [
+                                                Expanded(
+                                                  flex: 3,
+                                                  child: Column(
+                                                    crossAxisAlignment:
+                                                        CrossAxisAlignment
+                                                            .start,
+                                                    children: [
+                                                      Text(
+                                                        name,
+                                                        maxLines: 1,
+                                                        overflow: TextOverflow
+                                                            .ellipsis,
+                                                        style: const TextStyle(
+                                                          fontWeight:
+                                                              FontWeight.bold,
+                                                        ),
+                                                      ),
+                                                      if (code.isNotEmpty)
+                                                        Text(
+                                                          code,
+                                                          maxLines: 1,
+                                                          overflow: TextOverflow
+                                                              .ellipsis,
+                                                          style: Theme.of(
+                                                            context,
+                                                          ).textTheme.bodySmall,
+                                                        ),
+                                                    ],
+                                                  ),
+                                                ),
+
+                                                const SizedBox(width: 8),
+
+                                                Expanded(
+                                                  flex: 5,
+                                                  child: Column(
+                                                    children: [
+                                                      Row(
+                                                        children: [
+                                                          Expanded(
+                                                            child: Text(
+                                                              '$quantityText $unit',
+                                                              textAlign:
+                                                                  TextAlign
+                                                                      .center,
+                                                            ),
+                                                          ),
+                                                          Expanded(
+                                                            flex: 2,
+                                                            child: Text(
+                                                              '$priceText $currency',
+                                                              textAlign:
+                                                                  TextAlign
+                                                                      .center,
+                                                            ),
+                                                          ),
+                                                          Expanded(
+                                                            child: Text(
+                                                              discount > 0
+                                                                  ? '${discount.toStringAsFixed(discount % 1 == 0 ? 0 : 2)}%'
+                                                                  : '-',
+                                                              textAlign:
+                                                                  TextAlign
+                                                                      .center,
+                                                            ),
+                                                          ),
+                                                          Expanded(
+                                                            flex: 2,
+                                                            child: Text(
+                                                              '$totalText $currency',
+                                                              textAlign:
+                                                                  TextAlign
+                                                                      .center,
+                                                              style: const TextStyle(
+                                                                fontWeight:
+                                                                    FontWeight
+                                                                        .bold,
+                                                              ),
+                                                            ),
+                                                          ),
+                                                        ],
+                                                      ),
+                                                      if (quantity > stock)
+                                                        Padding(
+                                                          padding:
+                                                              const EdgeInsets.only(
+                                                                top: 4,
+                                                              ),
+                                                          child: Text(
+                                                            isArabic
+                                                                ? '⚠ المخزون غير كافٍ'
+                                                                : '⚠ Insufficient stock',
+                                                            style: TextStyle(
+                                                              fontSize: 11,
+                                                              color: Theme.of(
+                                                                context,
+                                                              ).colorScheme.error,
+                                                              fontWeight:
+                                                                  FontWeight
+                                                                      .bold,
+                                                            ),
+                                                          ),
+                                                        ),
+                                                    ],
+                                                  ),
+                                                ),
+
+                                                IconButton(
+                                                  visualDensity:
+                                                      VisualDensity.compact,
+                                                  tooltip: isArabic
+                                                      ? 'تعديل'
+                                                      : 'Edit',
+                                                  onPressed: () async {
+                                                    await openInvoiceItemEditor(
+                                                      existingRow: row,
+                                                    );
+                                                  },
+                                                  icon: const Icon(
+                                                    Icons.edit_outlined,
+                                                  ),
+                                                ),
+
+                                                IconButton(
+                                                  visualDensity:
+                                                      VisualDensity.compact,
+                                                  tooltip: isArabic
+                                                      ? 'حذف'
+                                                      : 'Delete',
+                                                  onPressed: () {
+                                                    setDialogState(() {
+                                                      invoiceItems.removeAt(
+                                                        index,
+                                                      );
+                                                    });
+                                                  },
+                                                  icon: const Icon(
+                                                    Icons.delete_outline,
+                                                  ),
+                                                ),
+                                              ],
+                                            ),
+                                          ),
+                                        );
+                                      }),
+                                  ],
+                                ),
+                              ),
+
+                              const SizedBox(height: 20),
+                              Padding(
+                                padding: const EdgeInsets.fromLTRB(
+                                  16,
+                                  8,
+                                  16,
+                                  16,
+                                ),
+                                child: Card(
+                                  child: Padding(
+                                    padding: const EdgeInsets.all(16),
+                                    child: Column(
+                                      crossAxisAlignment:
+                                          CrossAxisAlignment.stretch,
+                                      children: [
+                                        Row(
+                                          children: [
+                                            const Icon(
+                                              Icons.calculate_outlined,
+                                            ),
+                                            const SizedBox(width: 8),
+                                            Text(
+                                              isArabic
+                                                  ? 'الملخص المالي'
+                                                  : 'Financial Summary',
+                                              style: const TextStyle(
+                                                fontSize: 13,
+                                                fontWeight: FontWeight.bold,
+                                              ),
+                                            ),
+                                          ],
+                                        ),
+
+                                        const SizedBox(height: 6),
+
+                                        Builder(
+                                          builder: (context) {
+                                            final usdTotal = invoiceItemsTotal(
+                                              'USD',
+                                            );
+                                            final sypTotal = invoiceItemsTotal(
+                                              'SYP',
+                                            );
+
+                                            final customerCurrency =
+                                                selectedCustomer?['currency']
+                                                    ?.toString() ??
+                                                '';
+
+                                            Widget smallSummaryText(
+                                              String label,
+                                              String value, {
+                                              bool bold = false,
+                                            }) {
+                                              return Text(
+                                                '$label: $value',
+                                                style: TextStyle(
+                                                  fontSize: 12,
+                                                  fontWeight: bold
+                                                      ? FontWeight.bold
+                                                      : FontWeight.normal,
+                                                ),
+                                              );
+                                            }
+
+                                            final paidUsd =
+                                                double.tryParse(
+                                                  paidUsdController.text.trim(),
+                                                ) ??
+                                                0;
+
+                                            final paidSyp =
+                                                double.tryParse(
+                                                  paidSypController.text.trim(),
+                                                ) ??
+                                                0;
+
+                                            final finalUsdBalance =
+                                                previousBalanceUsd +
+                                                usdTotal -
+                                                paidUsd;
+
+                                            final finalSypBalance =
+                                                previousBalanceSyp +
+                                                sypTotal -
+                                                paidSyp;
+
+                                            return Column(
+                                              crossAxisAlignment:
+                                                  CrossAxisAlignment.stretch,
+                                              children: [
+                                                Wrap(
+                                                  spacing: 20,
+                                                  runSpacing: 5,
+                                                  children: [
+                                                    smallSummaryText(
+                                                      isArabic
+                                                          ? 'الإجمالي USD'
+                                                          : 'USD Total',
+                                                      '${usdTotal.toStringAsFixed(2)} USD',
+                                                      bold: true,
+                                                    ),
+                                                    smallSummaryText(
+                                                      isArabic
+                                                          ? 'الإجمالي SYP'
+                                                          : 'SYP Total',
+                                                      '${sypTotal.toStringAsFixed(0)} SYP',
+                                                      bold: true,
+                                                    ),
+                                                    if (selectedCustomer !=
+                                                        null)
+                                                      Wrap(
+                                                        spacing: 12,
+                                                        runSpacing: 4,
+                                                        children: [
+                                                          smallSummaryText(
+                                                            isArabic
+                                                                ? 'الرصيد السابق USD'
+                                                                : 'Previous USD Balance',
+                                                            '${previousBalanceUsd.toStringAsFixed(2)} USD',
+                                                          ),
+                                                          smallSummaryText(
+                                                            isArabic
+                                                                ? 'الرصيد السابق SYP'
+                                                                : 'Previous SYP Balance',
+                                                            '${previousBalanceSyp.toStringAsFixed(0)} SYP',
+                                                          ),
+                                                        ],
+                                                      ),
+                                                  ],
+                                                ),
+
+                                                const SizedBox(height: 12),
+
+                                                Row(
+                                                  children: [
+                                                    Expanded(
+                                                      child: TextField(
+                                                        controller:
+                                                            paidUsdController,
+                                                        keyboardType:
+                                                            const TextInputType.numberWithOptions(
+                                                              decimal: true,
+                                                            ),
+                                                        decoration: InputDecoration(
+                                                          labelText: isArabic
+                                                              ? 'المدفوع USD'
+                                                              : 'Paid USD',
+                                                          suffixText: 'USD',
+                                                          isDense: true,
+                                                          border:
+                                                              const OutlineInputBorder(),
+                                                        ),
+                                                        onChanged: (_) {
+                                                          setDialogState(() {});
+                                                        },
+                                                      ),
+                                                    ),
+                                                    const SizedBox(width: 12),
+                                                    Expanded(
+                                                      child: TextField(
+                                                        controller:
+                                                            paidSypController,
+                                                        keyboardType:
+                                                            const TextInputType.numberWithOptions(
+                                                              decimal: true,
+                                                            ),
+                                                        decoration: InputDecoration(
+                                                          labelText: isArabic
+                                                              ? 'المدفوع SYP'
+                                                              : 'Paid SYP',
+                                                          suffixText: 'SYP',
+                                                          isDense: true,
+                                                          border:
+                                                              const OutlineInputBorder(),
+                                                        ),
+                                                        onChanged: (_) {
+                                                          setDialogState(() {});
+                                                        },
+                                                      ),
+                                                    ),
+                                                  ],
+                                                ),
+
+                                                if (selectedCustomer !=
+                                                    null) ...[
+                                                  const SizedBox(height: 16),
+                                                  Center(
+                                                    child: Column(
+                                                      children: [
+                                                        Text(
+                                                          isArabic
+                                                              ? 'الرصيد النهائي'
+                                                              : 'Final Balance',
+                                                          textAlign:
+                                                              TextAlign.center,
+                                                          style:
+                                                              const TextStyle(
+                                                                fontSize: 15,
+                                                                fontWeight:
+                                                                    FontWeight
+                                                                        .w600,
+                                                              ),
+                                                        ),
+                                                        const SizedBox(
+                                                          height: 4,
+                                                        ),
+                                                        Wrap(
+                                                          alignment:
+                                                              WrapAlignment
+                                                                  .center,
+                                                          spacing: 28,
+                                                          runSpacing: 6,
+                                                          children: [
+                                                            Text(
+                                                              '${finalUsdBalance.toStringAsFixed(2)} USD',
+                                                              style: const TextStyle(
+                                                                fontSize: 22,
+                                                                fontWeight:
+                                                                    FontWeight
+                                                                        .bold,
+                                                              ),
+                                                            ),
+                                                            Text(
+                                                              '${finalSypBalance.toStringAsFixed(0)} SYP',
+                                                              style: const TextStyle(
+                                                                fontSize: 22,
+                                                                fontWeight:
+                                                                    FontWeight
+                                                                        .bold,
+                                                              ),
+                                                            ),
+                                                          ],
+                                                        ),
+                                                      ],
+                                                    ),
+                                                  ),
+                                                ],
+                                              ],
+                                            );
+                                          },
+                                        ),
+                                      ],
+                                    ),
+                                  ),
+                                ),
+                              ),
+                            ],
+                          ),
+                        ),
+                      ),
+                      const Divider(height: 1),
+
+                      Padding(
+                        padding: const EdgeInsets.all(16),
+                        child: Row(
+                          mainAxisAlignment: MainAxisAlignment.end,
+                          children: [
+                            if (isEditingSale) ...[
+                              TextButton.icon(
+                                onPressed: savingInvoice
+                                    ? null
+                                    : deleteAccountingSalesInvoice,
+                                icon: const Icon(Icons.delete_outline),
+                                label: Text(
+                                  isArabic ? 'حذف الفاتورة' : 'Delete Invoice',
+                                ),
+                              ),
+                              const SizedBox(width: 8),
+                            ],
+                            TextButton(
+                              onPressed: savingInvoice
+                                  ? null
+                                  : () {
+                                      Navigator.pop(dialogContext);
+                                    },
+                              child: Text(isArabic ? 'إغلاق' : 'Close'),
+                            ),
+                            const SizedBox(width: 8),
+                            FilledButton.icon(
+                              onPressed: savingInvoice
+                                  ? null
+                                  : saveAccountingSalesInvoice,
+                              icon: savingInvoice
+                                  ? const SizedBox(
+                                      width: 18,
+                                      height: 18,
+                                      child: CircularProgressIndicator(
+                                        strokeWidth: 2,
+                                      ),
+                                    )
+                                  : const Icon(Icons.save_outlined),
+                              label: Text(
+                                savingInvoice
+                                    ? (isArabic ? 'جارٍ الحفظ...' : 'Saving...')
+                                    : (isArabic
+                                          ? 'حفظ الفاتورة'
+                                          : 'Save Invoice'),
+                              ),
+                            ),
+                          ],
+                        ),
+                      ),
+                    ],
+                  ),
+                ),
+              );
+            },
+          );
+        },
+      );
+
+      customerSearchController.dispose();
+    } catch (e) {
+      if (!mounted) return;
+
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(
+          content: Text(
+            isArabic
+                ? 'تعذر فتح فاتورة المبيعات: $e'
+                : 'Unable to open sales invoice: $e',
+          ),
+        ),
+      );
+    }
+  }
+
+  Future<void> openNewAccountingSale() async {
+    final isArabic = widget.currentUser.language == 'ar';
+
+    try {
+      final data = await Supabase.instance.client
+          .from('accounting_customers')
+          .select()
+          .eq('created_by', widget.currentUser.id)
+          .eq('active', true)
+          .order('name');
+
+      if (!mounted) return;
+
+      final customers = List<Map<String, dynamic>>.from(data);
+
+      final searchController = TextEditingController();
+
+      String? customerId;
+
+      final selectedCustomerId = await showDialog<String>(
+        context: context,
+        builder: (dialogContext) {
+          return StatefulBuilder(
+            builder: (context, setDialogState) {
+              final search = searchController.text.trim().toLowerCase();
+
+              final filteredCustomers = customers.where((customer) {
+                final name = customer['name']?.toString().toLowerCase() ?? '';
+
+                return search.isEmpty || name.contains(search);
+              }).toList();
+
+              final exactExists = customers.any((customer) {
+                final name =
+                    customer['name']?.toString().trim().toLowerCase() ?? '';
+
+                return search.isNotEmpty && name == search;
+              });
+
+              return AlertDialog(
+                title: Text(
+                  isArabic ? 'فاتورة مبيعات جديدة' : 'New Sales Invoice',
+                ),
+                content: SizedBox(
+                  width: 500,
+                  child: Column(
+                    mainAxisSize: MainAxisSize.min,
+                    children: [
+                      TextField(
+                        controller: searchController,
+                        autofocus: true,
+                        decoration: InputDecoration(
+                          labelText: isArabic ? 'اسم الزبون' : 'Customer name',
+                          hintText: isArabic
+                              ? 'اكتب اسم الزبون للبحث'
+                              : 'Type customer name to search',
+                          prefixIcon: const Icon(Icons.search),
+                          border: const OutlineInputBorder(),
+                        ),
+                        onChanged: (_) {
+                          setDialogState(() {
+                            customerId = null;
+                          });
+                        },
+                      ),
+                      const SizedBox(height: 12),
+
+                      if (filteredCustomers.isNotEmpty)
+                        ConstrainedBox(
+                          constraints: const BoxConstraints(maxHeight: 220),
+                          child: ListView.builder(
+                            shrinkWrap: true,
+                            itemCount: filteredCustomers.length,
+                            itemBuilder: (context, index) {
+                              final customer = filteredCustomers[index];
+
+                              final id = customer['id'].toString();
+
+                              final selected = customerId == id;
+
+                              return ListTile(
+                                selected: selected,
+                                leading: Icon(
+                                  selected
+                                      ? Icons.check_circle
+                                      : Icons.person_outline,
+                                ),
+                                title: Text(
+                                  customer['name']?.toString() ?? '-',
+                                ),
+                                subtitle:
+                                    customer['phone'] == null ||
+                                        customer['phone'].toString().isEmpty
+                                    ? null
+                                    : Text(customer['phone'].toString()),
+                                onTap: () {
+                                  setDialogState(() {
+                                    customerId = id;
+                                    searchController.text =
+                                        customer['name']?.toString() ?? '';
+                                    searchController
+                                        .selection = TextSelection.fromPosition(
+                                      TextPosition(
+                                        offset: searchController.text.length,
+                                      ),
+                                    );
+                                  });
+                                },
+                              );
+                            },
+                          ),
+                        ),
+
+                      if (search.isNotEmpty && !exactExists) ...[
+                        const SizedBox(height: 8),
+                        ListTile(
+                          leading: const Icon(Icons.person_add),
+                          title: Text(
+                            isArabic
+                                ? 'إضافة "${searchController.text.trim()}" كزبون جديد'
+                                : 'Add "${searchController.text.trim()}" as a new customer',
+                          ),
+                          onTap: () {
+                            Navigator.pop(dialogContext, '__ADD_NEW__');
+                          },
+                        ),
+                      ],
+
+                      if (customers.isEmpty && search.isEmpty)
+                        Padding(
+                          padding: const EdgeInsets.all(12),
+                          child: Text(
+                            isArabic
+                                ? 'اكتب اسم الزبون لإضافته'
+                                : 'Type a customer name to add it',
+                          ),
+                        ),
+                    ],
+                  ),
+                ),
+                actions: [
+                  TextButton(
+                    onPressed: () {
+                      Navigator.pop(dialogContext);
+                    },
+                    child: Text(isArabic ? 'إلغاء' : 'Cancel'),
+                  ),
+                  FilledButton(
+                    onPressed: customerId == null
+                        ? null
+                        : () {
+                            Navigator.pop(dialogContext, customerId);
+                          },
+                    child: Text(isArabic ? 'متابعة' : 'Continue'),
+                  ),
+                ],
+              );
+            },
+          );
+        },
+      );
+
+      final typedName = searchController.text.trim();
+      searchController.dispose();
+
+      if (!mounted || selectedCustomerId == null) {
+        return;
+      }
+
+      if (selectedCustomerId == '__ADD_NEW__') {
+        final newCustomer = await addAccountingCustomer(initialName: typedName);
+
+        if (!mounted || newCustomer == null) return;
+
+        final newCustomerId = newCustomer['id']?.toString();
+
+        if (newCustomerId == null || newCustomerId.isEmpty) {
+          return;
+        }
+
+        await openAccountingSaleProducts(newCustomerId);
+
+        return;
+      }
+
+      await openAccountingSaleProducts(selectedCustomerId);
+    } catch (e) {
+      if (!mounted) return;
+
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(
+          content: Text(
+            isArabic
+                ? 'تعذر تحميل الزبائن: $e'
+                : 'Unable to load customers: $e',
+          ),
+        ),
+      );
+    }
+  }
+
+
+========== PURCHASE INVOICE ==========
+  Future<void> openAccountingPurchaseInvoicePage() async {
+    final isArabic = widget.currentUser.language == 'ar';
+
+    try {
+      final suppliersData = await Supabase.instance.client
+          .from('accounting_suppliers')
+          .select()
+          .eq('created_by', widget.currentUser.id)
+          .eq('active', true)
+          .order('name');
+
+      final productsData = await Supabase.instance.client
+          .from('accounting_products')
+          .select()
+          .eq('created_by', widget.currentUser.id)
+          .eq('active', true)
+          .order('name');
+
+      final purchasesData = await Supabase.instance.client
+          .from('accounting_purchases')
+          .select('invoice_number')
+          .eq('created_by', widget.currentUser.id)
+          .order('invoice_number', ascending: false)
+          .limit(1);
+
+      if (!mounted) return;
+
+      final suppliers = List<Map<String, dynamic>>.from(suppliersData);
+      final products = List<Map<String, dynamic>>.from(productsData);
+
+      if (suppliers.isEmpty) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(
+            content: Text(
+              isArabic
+                  ? 'يجب إضافة مورد فعال أولًا'
+                  : 'Please add an active supplier first',
+            ),
+          ),
+        );
+        return;
+      }
+
+      if (products.isEmpty) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(
+            content: Text(
+              isArabic
+                  ? 'يجب إضافة مادة فعالة أولًا'
+                  : 'Please add an active product first',
+            ),
+          ),
+        );
+        return;
+      }
+
+      int nextInvoiceNumber = 1;
+
+      if (purchasesData.isNotEmpty) {
+        final lastNumber =
+            (purchasesData.first['invoice_number'] as num?)?.toInt() ?? 0;
+        nextInvoiceNumber = lastNumber + 1;
+      }
+
+      String? selectedSupplierId;
+
+      final paidUsdController = TextEditingController(text: '0');
+      final paidSypController = TextEditingController(text: '0');
+      final notesController = TextEditingController();
+
+      final invoiceItems = <Map<String, dynamic>>[];
+
+      bool savingInvoice = false;
+
+      double parseNumber(String value) {
+        var text = value.trim().replaceAll(',', '');
+
+        if (text.isEmpty) return 0;
+
+        final direct = double.tryParse(text);
+
+        if (direct != null) return direct;
+
+        if (text.contains('*')) {
+          final parts = text.split('*');
+
+          double result = 1;
+
+          for (final part in parts) {
+            final number = double.tryParse(part.trim());
+
+            if (number == null) return 0;
+
+            result *= number;
+          }
+
+          return result;
+        }
+
+        return 0;
+      }
+
+      double itemTotal(Map<String, dynamic> item) {
+        final quantity = parseNumber(
+          (item['quantityController'] as TextEditingController).text,
+        );
+
+        final price = parseNumber(
+          (item['priceController'] as TextEditingController).text,
+        );
+
+        final discount = parseNumber(
+          (item['discountController'] as TextEditingController).text,
+        );
+
+        final beforeDiscount = quantity * price;
+
+        if (discount <= 0) {
+          return beforeDiscount;
+        }
+
+        return beforeDiscount * (1 - (discount / 100));
+      }
+
+      await showDialog<void>(
+        context: context,
+        barrierDismissible: false,
+        builder: (dialogContext) {
+          return StatefulBuilder(
+            builder: (context, setDialogState) {
+              double totalUsd = 0;
+              double totalSyp = 0;
+
+              for (final item in invoiceItems) {
+                final total = itemTotal(item);
+                final currency = item['currency']?.toString() ?? 'USD';
+
+                if (currency == 'SYP') {
+                  totalSyp += total;
+                } else {
+                  totalUsd += total;
+                }
+              }
+
+              final paidUsd = parseNumber(paidUsdController.text);
+              final paidSyp = parseNumber(paidSypController.text);
+
+              final remainingUsd = totalUsd - paidUsd;
+              final remainingSyp = totalSyp - paidSyp;
+
+              return AlertDialog(
+                title: Text(
+                  isArabic
+                      ? 'فاتورة مشتريات رقم $nextInvoiceNumber'
+                      : 'Purchase Invoice $nextInvoiceNumber',
+                ),
+                content: SizedBox(
+                  width: 850,
+                  child: SingleChildScrollView(
+                    child: Column(
+                      mainAxisSize: MainAxisSize.min,
+                      children: [
+                        DropdownButtonFormField<String>(
+                          initialValue: selectedSupplierId,
+                          decoration: InputDecoration(
+                            labelText: isArabic ? 'المورد' : 'Supplier',
+                            border: const OutlineInputBorder(),
+                          ),
+                          items: suppliers.map((supplier) {
+                            return DropdownMenuItem<String>(
+                              value: supplier['id']?.toString(),
+                              child: Text(supplier['name']?.toString() ?? '-'),
+                            );
+                          }).toList(),
+                          onChanged: (value) {
+                            setDialogState(() {
+                              selectedSupplierId = value;
+                            });
+                          },
+                        ),
+
+                        const SizedBox(height: 16),
+
+                        Align(
+                          alignment: AlignmentDirectional.centerStart,
+                          child: FilledButton.icon(
+                            onPressed: () {
+                              setDialogState(() {
+                                invoiceItems.add({
+                                  'product_id': null,
+                                  'quantityController': TextEditingController(
+                                    text: '1',
+                                  ),
+                                  'priceController': TextEditingController(
+                                    text: '0',
+                                  ),
+                                  'discountController': TextEditingController(
+                                    text: '0',
+                                  ),
+                                  'currency': 'USD',
+                                });
+                              });
+                            },
+                            icon: const Icon(Icons.add),
+                            label: Text(
+                              isArabic ? 'إضافة مادة' : 'Add Product',
+                            ),
+                          ),
+                        ),
+
+                        const SizedBox(height: 12),
+
+                        if (invoiceItems.isEmpty)
+                          Padding(
+                            padding: const EdgeInsets.symmetric(vertical: 24),
+                            child: Text(
+                              isArabic
+                                  ? 'لم تتم إضافة مواد بعد'
+                                  : 'No products added yet',
+                            ),
+                          ),
+
+                        for (
+                          int index = 0;
+                          index < invoiceItems.length;
+                          index++
+                        ) ...[
+                          Builder(
+                            builder: (context) {
+                              final item = invoiceItems[index];
+
+                              return Card(
+                                child: Padding(
+                                  padding: const EdgeInsets.all(12),
+                                  child: Column(
+                                    children: [
+                                      Row(
+                                        children: [
+                                          Expanded(
+                                            flex: 3,
+                                            child: DropdownButtonFormField<String>(
+                                              initialValue: item['product_id']
+                                                  ?.toString(),
+                                              decoration: InputDecoration(
+                                                labelText: isArabic
+                                                    ? 'المادة'
+                                                    : 'Product',
+                                                border:
+                                                    const OutlineInputBorder(),
+                                              ),
+                                              items: products.map((product) {
+                                                return DropdownMenuItem<String>(
+                                                  value: product['id']
+                                                      ?.toString(),
+                                                  child: Text(
+                                                    product['name']
+                                                            ?.toString() ??
+                                                        '-',
+                                                  ),
+                                                );
+                                              }).toList(),
+                                              onChanged: (value) {
+                                                setDialogState(() {
+                                                  item['product_id'] = value;
+
+                                                  Map<String, dynamic>?
+                                                  selectedProduct;
+
+                                                  for (final product
+                                                      in products) {
+                                                    if (product['id']
+                                                            ?.toString() ==
+                                                        value) {
+                                                      selectedProduct = product;
+                                                      break;
+                                                    }
+                                                  }
+
+                                                  if (selectedProduct != null) {
+                                                    final purchasePrice =
+                                                        (selectedProduct['purchase_price']
+                                                                as num?)
+                                                            ?.toDouble();
+
+                                                    if (purchasePrice != null) {
+                                                      (item['priceController']
+                                                              as TextEditingController)
+                                                          .text = purchasePrice
+                                                          .toStringAsFixed(2);
+                                                    }
+
+                                                    final productCurrency =
+                                                        selectedProduct['currency']
+                                                            ?.toString() ??
+                                                        'USD';
+
+                                                    item['currency'] =
+                                                        productCurrency == 'SYP'
+                                                        ? 'SYP'
+                                                        : 'USD';
+                                                  }
+                                                });
+                                              },
+                                            ),
+                                          ),
+                                          const SizedBox(width: 8),
+                                          Expanded(
+                                            child: TextField(
+                                              controller:
+                                                  item['quantityController']
+                                                      as TextEditingController,
+                                              keyboardType:
+                                                  const TextInputType.numberWithOptions(
+                                                    decimal: true,
+                                                  ),
+                                              decoration: InputDecoration(
+                                                labelText: isArabic
+                                                    ? 'الكمية'
+                                                    : 'Qty',
+                                                border:
+                                                    const OutlineInputBorder(),
+                                              ),
+                                              onChanged: (_) {
+                                                setDialogState(() {});
+                                              },
+                                            ),
+                                          ),
+                                          const SizedBox(width: 8),
+                                          Expanded(
+                                            flex: 2,
+                                            child: TextField(
+                                              controller:
+                                                  item['priceController']
+                                                      as TextEditingController,
+                                              keyboardType: TextInputType.text,
+                                              decoration: InputDecoration(
+                                                labelText: isArabic
+                                                    ? 'سعر الشراء'
+                                                    : 'Purchase Price',
+                                                border:
+                                                    const OutlineInputBorder(),
+                                              ),
+                                              onChanged: (_) {
+                                                setDialogState(() {});
+                                              },
+                                            ),
+                                          ),
+                                          const SizedBox(width: 8),
+                                          SizedBox(
+                                            width: 110,
+                                            child: DropdownButtonFormField<String>(
+                                              initialValue:
+                                                  item['currency']
+                                                      ?.toString() ??
+                                                  'USD',
+                                              decoration: InputDecoration(
+                                                labelText: isArabic
+                                                    ? 'العملة'
+                                                    : 'Currency',
+                                                border:
+                                                    const OutlineInputBorder(),
+                                              ),
+                                              items: const [
+                                                DropdownMenuItem(
+                                                  value: 'USD',
+                                                  child: Text('USD'),
+                                                ),
+                                                DropdownMenuItem(
+                                                  value: 'SYP',
+                                                  child: Text('SYP'),
+                                                ),
+                                              ],
+                                              onChanged: (value) {
+                                                if (value == null) return;
+
+                                                setDialogState(() {
+                                                  item['currency'] = value;
+                                                });
+                                              },
+                                            ),
+                                          ),
+                                          const SizedBox(width: 8),
+                                          SizedBox(
+                                            width: 95,
+                                            child: TextField(
+                                              controller:
+                                                  item['discountController']
+                                                      as TextEditingController,
+                                              keyboardType:
+                                                  const TextInputType.numberWithOptions(
+                                                    decimal: true,
+                                                  ),
+                                              decoration: InputDecoration(
+                                                labelText: isArabic
+                                                    ? 'خصم %'
+                                                    : 'Discount %',
+                                                border:
+                                                    const OutlineInputBorder(),
+                                              ),
+                                              onChanged: (_) {
+                                                setDialogState(() {});
+                                              },
+                                            ),
+                                          ),
+                                          IconButton(
+                                            tooltip: isArabic
+                                                ? 'حذف'
+                                                : 'Delete',
+                                            onPressed: () {
+                                              setDialogState(() {
+                                                invoiceItems.removeAt(index);
+                                              });
+                                            },
+                                            icon: const Icon(
+                                              Icons.delete_outline,
+                                            ),
+                                          ),
+                                        ],
+                                      ),
+                                      const SizedBox(height: 8),
+                                      Align(
+                                        alignment:
+                                            AlignmentDirectional.centerEnd,
+                                        child: Text(
+                                          '${isArabic ? 'إجمالي المادة' : 'Item Total'}: '
+                                          '${itemTotal(item).toStringAsFixed(item['currency'] == 'SYP' ? 0 : 2)} '
+                                          '${item['currency']}',
+                                          style: const TextStyle(
+                                            fontWeight: FontWeight.bold,
+                                          ),
+                                        ),
+                                      ),
+                                    ],
+                                  ),
+                                ),
+                              );
+                            },
+                          ),
+                        ],
+
+                        const SizedBox(height: 16),
+
+                        Row(
+                          children: [
+                            Expanded(
+                              child: TextField(
+                                controller: paidUsdController,
+                                keyboardType: TextInputType.text,
+                                decoration: InputDecoration(
+                                  labelText: isArabic
+                                      ? 'المدفوع USD'
+                                      : 'Paid USD',
+                                  border: const OutlineInputBorder(),
+                                ),
+                                onChanged: (_) {
+                                  setDialogState(() {});
+                                },
+                              ),
+                            ),
+                            const SizedBox(width: 12),
+                            Expanded(
+                              child: TextField(
+                                controller: paidSypController,
+                                keyboardType: TextInputType.text,
+                                decoration: InputDecoration(
+                                  labelText: isArabic
+                                      ? 'المدفوع SYP'
+                                      : 'Paid SYP',
+                                  border: const OutlineInputBorder(),
+                                ),
+                                onChanged: (_) {
+                                  setDialogState(() {});
+                                },
+                              ),
+                            ),
+                          ],
+                        ),
+
+                        const SizedBox(height: 12),
+
+                        TextField(
+                          controller: notesController,
+                          maxLines: 2,
+                          decoration: InputDecoration(
+                            labelText: isArabic ? 'ملاحظات' : 'Notes',
+                            border: const OutlineInputBorder(),
+                          ),
+                        ),
+
+                        const SizedBox(height: 16),
+
+                        Container(
+                          width: double.infinity,
+                          padding: const EdgeInsets.all(14),
+                          decoration: BoxDecoration(
+                            color: Theme.of(context)
+                                .colorScheme
+                                .surfaceContainerHighest,
+                            borderRadius: BorderRadius.circular(12),
+                          ),
+                          child: Wrap(
+                            spacing: 24,
+                            runSpacing: 10,
+                            children: [
+                              Text(
+                                'USD: ${totalUsd.toStringAsFixed(2)}',
+                                style: const TextStyle(
+                                  fontWeight: FontWeight.bold,
+                                ),
+                              ),
+                              Text(
+                                'SYP: ${totalSyp.toStringAsFixed(0)}',
+                                style: const TextStyle(
+                                  fontWeight: FontWeight.bold,
+                                ),
+                              ),
+                              Text(
+                                '${isArabic ? 'المتبقي USD' : 'Remaining USD'}: '
+                                '${remainingUsd.toStringAsFixed(2)}',
+                              ),
+                              Text(
+                                '${isArabic ? 'المتبقي SYP' : 'Remaining SYP'}: '
+                                '${remainingSyp.toStringAsFixed(0)}',
+                              ),
+                            ],
+                          ),
+                        ),
+                      ],
+                    ),
+                  ),
+                ),
+                actions: [
+                  TextButton(
+                    onPressed: savingInvoice
+                        ? null
+                        : () {
+                            Navigator.pop(dialogContext);
+                          },
+                    child: Text(isArabic ? 'إلغاء' : 'Cancel'),
+                  ),
+                  FilledButton.icon(
+                    onPressed: savingInvoice
+                        ? null
+                        : () async {
+                            if (selectedSupplierId == null ||
+                                selectedSupplierId!.isEmpty) {
+                              ScaffoldMessenger.of(context).showSnackBar(
+                                SnackBar(
+                                  content: Text(
+                                    isArabic
+                                        ? 'اختر المورد'
+                                        : 'Select a supplier',
+                                  ),
+                                ),
+                              );
+                              return;
+                            }
+
+                            if (invoiceItems.isEmpty) {
+                              ScaffoldMessenger.of(context).showSnackBar(
+                                SnackBar(
+                                  content: Text(
+                                    isArabic
+                                        ? 'أضف مادة واحدة على الأقل'
+                                        : 'Add at least one product',
+                                  ),
+                                ),
+                              );
+                              return;
+                            }
+
+                            for (final item in invoiceItems) {
+                              final productId = item['product_id']?.toString();
+
+                              final quantity = parseNumber(
+                                (item['quantityController']
+                                        as TextEditingController)
+                                    .text,
+                              );
+
+                              final price = parseNumber(
+                                (item['priceController']
+                                        as TextEditingController)
+                                    .text,
+                              );
+
+                              if (productId == null ||
+                                  productId.isEmpty ||
+                                  quantity <= 0 ||
+                                  price < 0) {
+                                ScaffoldMessenger.of(context).showSnackBar(
+                                  SnackBar(
+                                    content: Text(
+                                      isArabic
+                                          ? 'تحقق من المادة والكمية والسعر'
+                                          : 'Check product, quantity and price',
+                                    ),
+                                  ),
+                                );
+                                return;
+                              }
+                            }
+
+                            final finalPaidUsd = parseNumber(
+                              paidUsdController.text,
+                            );
+                            final finalPaidSyp = parseNumber(
+                              paidSypController.text,
+                            );
+
+                            if (finalPaidUsd < 0 ||
+                                finalPaidSyp < 0 ||
+                                finalPaidUsd > totalUsd ||
+                                finalPaidSyp > totalSyp) {
+                              ScaffoldMessenger.of(context).showSnackBar(
+                                SnackBar(
+                                  content: Text(
+                                    isArabic
+                                        ? 'قيمة المدفوع غير صحيحة'
+                                        : 'Invalid paid amount',
+                                  ),
+                                ),
+                              );
+                              return;
+                            }
+
+                            setDialogState(() {
+                              savingInvoice = true;
+                            });
+
+                            try {
+                              final purchaseData = await Supabase
+                                  .instance
+                                  .client
+                                  .from('accounting_purchases')
+                                  .insert({
+                                    'supplier_id': selectedSupplierId,
+                                    'invoice_date': DateTime.now()
+                                        .toIso8601String(),
+                                    'subtotal': totalUsd + totalSyp,
+                                    'discount': 0,
+                                    'total': totalUsd + totalSyp,
+                                    'paid_amount': finalPaidUsd + finalPaidSyp,
+                                    'currency': 'USD',
+                                    'subtotal_usd': totalUsd,
+                                    'subtotal_syp': totalSyp,
+                                    'discount_usd': 0,
+                                    'discount_syp': 0,
+                                    'total_usd': totalUsd,
+                                    'total_syp': totalSyp,
+                                    'paid_usd': finalPaidUsd,
+                                    'paid_syp': finalPaidSyp,
+                                    'notes': notesController.text.trim(),
+                                    'status': 'posted',
+                                    'created_by': widget.currentUser.id,
+                                  })
+                                  .select()
+                                  .single();
+
+                              final purchaseId = purchaseData['id']?.toString();
+
+                              if (purchaseId == null || purchaseId.isEmpty) {
+                                throw Exception(
+                                  isArabic
+                                      ? 'تعذر الحصول على رقم الفاتورة'
+                                      : 'Unable to get invoice ID',
+                                );
+                              }
+
+                              final itemsToInsert = <Map<String, dynamic>>[];
+
+                              for (final item in invoiceItems) {
+                                final quantity = parseNumber(
+                                  (item['quantityController']
+                                          as TextEditingController)
+                                      .text,
+                                );
+
+                                final unitPrice = parseNumber(
+                                  (item['priceController']
+                                          as TextEditingController)
+                                      .text,
+                                );
+
+                                final discountPercent = parseNumber(
+                                  (item['discountController']
+                                          as TextEditingController)
+                                      .text,
+                                );
+
+                                itemsToInsert.add({
+                                  'purchase_id': purchaseId,
+                                  'product_id': item['product_id'],
+                                  'quantity': quantity,
+                                  'unit_cost': unitPrice,
+                                  'discount': discountPercent,
+                                  'total': itemTotal(item),
+                                  'currency':
+                                      item['currency']?.toString() ?? 'USD',
+                                });
+                              }
+
+                              await Supabase.instance.client
+                                  .from('accounting_purchase_items')
+                                  .insert(itemsToInsert);
+
+                              // زيادة المخزون حسب مواد فاتورة المشتريات
+                              for (final item in invoiceItems) {
+                                final productId = item['product_id']
+                                    ?.toString();
+
+                                if (productId == null || productId.isEmpty) {
+                                  continue;
+                                }
+
+                                final quantity = parseNumber(
+                                  (item['quantityController']
+                                          as TextEditingController)
+                                      .text,
+                                );
+
+                                if (quantity <= 0) {
+                                  continue;
+                                }
+
+                                final freshProduct = await Supabase
+                                    .instance
+                                    .client
+                                    .from('accounting_products')
+                                    .select('quantity')
+                                    .eq('id', productId)
+                                    .eq('created_by', widget.currentUser.id)
+                                    .single();
+
+                                final quantityBefore =
+                                    (freshProduct['quantity'] as num?)
+                                        ?.toDouble() ??
+                                    0;
+
+                                final quantityAfter = quantityBefore + quantity;
+
+                                await Supabase.instance.client
+                                    .from('accounting_products')
+                                    .update({
+                                      'quantity': quantityAfter,
+                                      'updated_at': DateTime.now()
+                                          .toIso8601String(),
+                                    })
+                                    .eq('id', productId)
+                                    .eq('created_by', widget.currentUser.id);
+
+                                try {
+                                  await Supabase.instance.client
+                                      .from('accounting_inventory_movements')
+                                      .insert({
+                                        'product_id': productId,
+                                        'movement_type': 'purchase',
+                                        'quantity': quantity,
+                                        'quantity_before': quantityBefore,
+                                        'quantity_after': quantityAfter,
+                                        'reference_id': purchaseId,
+                                        'notes': isArabic
+                                            ? 'شراء - فاتورة رقم $nextInvoiceNumber'
+                                            : 'Purchase - Invoice $nextInvoiceNumber',
+                                        'movement_date': DateTime.now()
+                                            .toIso8601String(),
+                                        'created_by': widget.currentUser.id,
+                                      });
+                                } catch (_) {
+                                  // إذا فشل تسجيل حركة المخزون
+                                  // نعيد كمية المادة كما كانت.
+                                  await Supabase.instance.client
+                                      .from('accounting_products')
+                                      .update({
+                                        'quantity': quantityBefore,
+                                        'updated_at': DateTime.now()
+                                            .toIso8601String(),
+                                      })
+                                      .eq('id', productId)
+                                      .eq('created_by', widget.currentUser.id);
+
+                                  rethrow;
+                                }
+                              }
+
+                              await loadAccountingProducts();
+                              await loadAccountingPurchases();
+
+                              if (!mounted) return;
+
+                              Navigator.pop(dialogContext);
+
+                              ScaffoldMessenger.of(context).showSnackBar(
+                                SnackBar(
+                                  content: Text(
+                                    isArabic
+                                        ? 'تم حفظ فاتورة المشتريات بنجاح'
+                                        : 'Purchase invoice saved successfully',
+                                  ),
+                                ),
+                              );
+                            } catch (e) {
+                              debugPrint('SAVE ACCOUNTING PURCHASE ERROR: $e');
+
+                              if (!mounted) return;
+
+                              setDialogState(() {
+                                savingInvoice = false;
+                              });
+
+                              ScaffoldMessenger.of(context).showSnackBar(
+                                SnackBar(
+                                  content: Text(
+                                    isArabic
+                                        ? 'تعذر حفظ فاتورة المشتريات: $e'
+                                        : 'Unable to save purchase invoice: $e',
+                                  ),
+                                  backgroundColor: Colors.red,
+                                ),
+                              );
+                            }
+                          },
+                    icon: savingInvoice
+                        ? const SizedBox(
+                            width: 18,
+                            height: 18,
+                            child: CircularProgressIndicator(strokeWidth: 2),
+                          )
+                        : const Icon(Icons.save),
+                    label: Text(isArabic ? 'حفظ الفاتورة' : 'Save Invoice'),
+                  ),
+                ],
+              );
+            },
+          );
+        },
+      );
+    } catch (e) {
+      debugPrint('OPEN ACCOUNTING PURCHASE ERROR: $e');
+
+      if (!mounted) return;
+
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(
+          content: Text(
+            isArabic
+                ? 'تعذر فتح فاتورة المشتريات: $e'
+                : 'Unable to open purchase invoice: $e',
+          ),
+          backgroundColor: Colors.red,
+        ),
+      );
+    }
+  }
+
+
+========== PURCHASE LIST ==========
+  Widget buildAccountingPurchases() {
+    final isArabic = widget.currentUser.language == 'ar';
+    final colorScheme = Theme.of(context).colorScheme;
+
+    String formatPurchaseDate(dynamic value) {
+      if (value == null) return '-';
+
+      final date = DateTime.tryParse(value.toString());
+
+      if (date == null) return value.toString();
+
+      return '${date.day.toString().padLeft(2, '0')}/'
+          '${date.month.toString().padLeft(2, '0')}/'
+          '${date.year}';
+    }
+
+    Widget moneyCell({
+      required double usd,
+      required double syp,
+      bool emphasize = false,
+    }) {
+      final style = TextStyle(
+        fontSize: emphasize ? 14 : 13,
+        fontWeight: emphasize ? FontWeight.w600 : FontWeight.w500,
+      );
+
+      return Column(
+        mainAxisSize: MainAxisSize.min,
+        children: [
+          Text('${usd.toStringAsFixed(2)} USD', style: style),
+          const SizedBox(height: 3),
+          Text(
+            '${syp.toStringAsFixed(0)} SYP',
+            style: style.copyWith(
+              fontSize: emphasize ? 13 : 12,
+              color: colorScheme.onSurfaceVariant,
+            ),
+          ),
+        ],
+      );
+    }
+
+    Widget headerCell(String text, {int flex = 1}) {
+      return Expanded(
+        flex: flex,
+        child: Center(
+          child: Text(
+            text,
+            textAlign: TextAlign.center,
+            style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 13),
+          ),
+        ),
+      );
+    }
+
+    Widget dataCell(Widget child, {int flex = 1}) {
+      return Expanded(
+        flex: flex,
+        child: Center(child: child),
+      );
+    }
+
+    return Padding(
+      padding: const EdgeInsets.all(20),
+      child: Column(
+        children: [
+          Row(
+            children: [
+              IconButton(
+                onPressed: () {
+                  setState(() {
+                    selectedIndex = 14;
+                  });
+                },
+                icon: const Icon(Icons.arrow_back),
+              ),
+              const SizedBox(width: 8),
+              Expanded(
+                child: Text(
+                  isArabic ? 'فواتير المشتريات' : 'Purchase Invoices',
+                  style: const TextStyle(
+                    fontSize: 28,
+                    fontWeight: FontWeight.bold,
+                  ),
+                ),
+              ),
+              IconButton(
+                tooltip: isArabic ? 'تحديث' : 'Refresh',
+                onPressed: loadAccountingPurchases,
+                icon: const Icon(Icons.refresh),
+              ),
+              const SizedBox(width: 8),
+              FilledButton.icon(
+                onPressed: openAccountingPurchaseInvoicePage,
+                icon: const Icon(Icons.add),
+                label: Text(isArabic ? 'فاتورة جديدة' : 'New Invoice'),
+              ),
+            ],
+          ),
+
+          const SizedBox(height: 20),
+
+          Container(
+            padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 14),
+            decoration: BoxDecoration(
+              color: colorScheme.surfaceContainerHighest,
+              borderRadius: const BorderRadius.vertical(
+                top: Radius.circular(12),
+              ),
+            ),
+            child: Row(
+              children: [
+                headerCell(isArabic ? 'رقم الفاتورة' : 'Invoice No.'),
+                headerCell(isArabic ? 'المورد' : 'Supplier', flex: 2),
+                headerCell(
+                  isArabic ? 'قيمة الفاتورة' : 'Invoice Total',
+                  flex: 2,
+                ),
+                headerCell(isArabic ? 'التاريخ' : 'Date', flex: 2),
+                headerCell(isArabic ? 'المدفوع' : 'Paid', flex: 2),
+                headerCell(isArabic ? 'المتبقي' : 'Remaining', flex: 2),
+              ],
+            ),
+          ),
+
+          Expanded(
+            child: accountingPurchasesLoading
+                ? const Center(child: CircularProgressIndicator())
+                : accountingPurchases.isEmpty
+                ? Center(
+                    child: Text(
+                      isArabic
+                          ? 'لا توجد فواتير مشتريات حتى الآن'
+                          : 'No purchase invoices yet',
+                    ),
+                  )
+                : ListView.separated(
+                    itemCount: accountingPurchases.length,
+                    separatorBuilder: (_, _) => const Divider(height: 1),
+                    itemBuilder: (context, index) {
+                      final purchase = accountingPurchases[index];
+
+                      final number =
+                          purchase['invoice_number']?.toString() ?? '-';
+
+                      final supplierName =
+                          purchase['_supplier_name']?.toString() ?? '-';
+
+                      final totalUsd =
+                          (purchase['total_usd'] as num?)?.toDouble() ?? 0;
+
+                      final totalSyp =
+                          (purchase['total_syp'] as num?)?.toDouble() ?? 0;
+
+                      final paidUsd =
+                          (purchase['paid_usd'] as num?)?.toDouble() ?? 0;
+
+                      final paidSyp =
+                          (purchase['paid_syp'] as num?)?.toDouble() ?? 0;
+
+                      final remainingUsd = totalUsd - paidUsd;
+
+                      final remainingSyp = totalSyp - paidSyp;
+
+                      return Material(
+                        color: index.isEven
+                            ? colorScheme.surface
+                            : colorScheme.surfaceContainerLowest,
+                        child: Padding(
+                          padding: const EdgeInsets.symmetric(
+                            horizontal: 12,
+                            vertical: 12,
+                          ),
+                          child: Row(
+                            children: [
+                              dataCell(
+                                Text(
+                                  '#$number',
+                                  style: const TextStyle(
+                                    fontWeight: FontWeight.bold,
+                                  ),
+                                ),
+                              ),
+                              dataCell(
+                                Text(
+                                  supplierName,
+                                  textAlign: TextAlign.center,
+                                  maxLines: 2,
+                                  overflow: TextOverflow.ellipsis,
+                                ),
+                                flex: 2,
+                              ),
+                              dataCell(
+                                moneyCell(
+                                  usd: totalUsd,
+                                  syp: totalSyp,
+                                  emphasize: true,
+                                ),
+                                flex: 2,
+                              ),
+                              dataCell(
+                                Text(
+                                  formatPurchaseDate(purchase['invoice_date']),
+                                  textAlign: TextAlign.center,
+                                ),
+                                flex: 2,
+                              ),
+                              dataCell(
+                                moneyCell(usd: paidUsd, syp: paidSyp),
+                                flex: 2,
+                              ),
+                              dataCell(
+                                moneyCell(
+                                  usd: remainingUsd,
+                                  syp: remainingSyp,
+                                  emphasize: true,
+                                ),
+                                flex: 2,
+                              ),
+                            ],
+                          ),
+                        ),
+                      );
+                    },
+                  ),
+          ),
+        ],
+      ),
+    );
+  }
+
+  Widget buildNotificationsPage() {
+    final isArabic = widget.currentUser.language == 'ar';
+
+    return Padding(
+      padding: const EdgeInsets.all(20),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Row(
+            children: [
+              Icon(
+                Icons.notifications_rounded,
+                size: 30,
+                color: Theme.of(context).colorScheme.primary,
+              ),
+              const SizedBox(width: 10),
+              Text(
+                isArabic ? 'الإشعارات' : 'Notifications',
+                style: const TextStyle(
+                  fontSize: 28,
+                  fontWeight: FontWeight.bold,
+                ),
+              ),
+            ],
+          ),
+          const SizedBox(height: 24),
+          Expanded(
+            child: Center(
+              child: Column(
+                mainAxisSize: MainAxisSize.min,
+                children: [
+                  Icon(
+                    Icons.notifications_none_rounded,
+                    size: 72,
+                    color: Theme.of(context).colorScheme.onSurfaceVariant
+                        .withValues(alpha: 0.55),
+                  ),
+                  const SizedBox(height: 16),
+                  Text(
+                    isArabic
+                        ? 'لا توجد إشعارات حاليًا'
+                        : 'No notifications yet',
+                    style: Theme.of(context).textTheme.titleMedium,
+                  ),
+                  const SizedBox(height: 6),
+                  Text(
+                    isArabic
+                        ? 'سيتم عرض تنبيهات النظام هنا'
+                        : 'System alerts will appear here',
+                    style: Theme.of(context).textTheme.bodyMedium,
+                  ),
+                ],
+              ),
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+
+  Future<void> addBroadbandProfile() async {
+    if (!hasAgentPermission('add_broadband_profile')) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(
+          content: Text('ليس لديك صلاحية لإضافة بروفايل Broadband'),
+          backgroundColor: Colors.red,
+        ),
+      );
+      return;
+    }
+
+    final nameController = TextEditingController();
+    final priceController = TextEditingController();
+    final durationController = TextEditingController(text: '30');
+    final downloadController = TextEditingController();
+    final uploadController = TextEditingController();
+    final mikrotikNameController = TextEditingController();
+
+    String currency = widget.currentUser.currency == 'USD' ? 'USD' : 'SYP';
+    bool saving = false;
+
+    // --------------------------------------------------------
+    // تحديد صاحب الأجهزة:
+    // المدير والمستخدم => أجهزتهما فقط
+    // الوكيل => أجهزة المستخدم المسؤول عنه
+    // --------------------------------------------------------
+
+    final profileOwnerId = widget.currentUser.role == 'وكيل'
+        ? widget.currentUser.parentUserId
+        : widget.currentUser.id;
+
+    if (profileOwnerId == null || profileOwnerId.isEmpty) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(
+          content: Text('تعذر تحديد صاحب أجهزة الشبكة'),
+          backgroundColor: Colors.red,
+        ),
+      );
+      return;
+    }
+
+    List<NetworkDevice> profileDevices = [];
+
+    try {
+      final deviceData = await Supabase.instance.client
+          .from('network_devices')
+          .select()
+          .eq('user_id', profileOwnerId)
