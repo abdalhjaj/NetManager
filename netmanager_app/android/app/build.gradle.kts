@@ -18,7 +18,7 @@ if (signingPropertiesFile.exists()) {
 android {
     signingConfigs {
         create("netmanagerRelease") {
-            storeFile = file(signingProperties.getProperty("storeFile", ""))
+            storeFile = signingProperties.getProperty("storeFile")?.takeIf { it.isNotBlank() }?.let { file(it) }
             storePassword = signingProperties.getProperty("storePassword", "")
             keyAlias = signingProperties.getProperty("keyAlias", "")
             keyPassword = signingProperties.getProperty("keyPassword", "")
